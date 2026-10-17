@@ -1,39 +1,67 @@
-# 智扫通 AI Agent
+# 扫净灵 AI Agent
+
+[![CI](https://github.com/Mooncake12-star/saojingling-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Mooncake12-star/saojingling-agent/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.11-blue)](https://www.python.org/)
 
 基于 **ReAct Agent + RAG + MCP + FastAPI + Redis + SQL** 的智能客服助手，专为扫地机器人/扫拖一体机器人场景打造。
 
 ## 技术栈
 
-| 模块 | 技术 |
-|------|------|
-| 前端界面 | Streamlit |
-| API 服务 | FastAPI + Uvicorn |
-| AI Agent | LangChain ReAct Agent |
-| 工具协议 | MCP (Model Context Protocol) |
-| 向量库 | ChromaDB + BGE Reranker |
-| RAG 检索 | Ensemble Retrieval (向量+BM25) + Query Rewrite + Reranker |
-| 多模态 | Qwen-VL-Max 图片分析 |
-| 大模型 | Qwen3-Max (DashScope) |
-| 数据库 | SQLite |
-| 缓存 | Redis |
-| PDF 报告 | fpdf2 |
+| 模块 | 技术                                                      |
+|------|---------------------------------------------------------|
+| 前端界面 | Streamlit                                               |
+| API 服务 | FastAPI + Uvicorn                                       |
+| AI Agent | LangChain ReAct Agent                                   |
+| 工具协议 | MCP (Model Context Protocol)                            |
+| 向量库 | ChromaDB                               |
+| RAG 检索 | Ensemble Retrieval (向量+BM25) + Query Rewrite + BGE Reranker|
+| 多模态 | Qwen-VL-Max 图片分析                                        |
+| 大模型 | Qwen3.8-flash (DashScope)                               |
+| 数据库 | SQLite                                                  |
+| 缓存 | Redis                                                   |
+| PDF 报告 | fpdf2                                                   |
 
 ## 快速开始
 
-### 1. 克隆并配置
+### 1. 克隆并配置 API Key
 
 ```bash
-git clone <your-repo-url>
-cd Agent智扫通项目
+git clone https://github.com/Mooncake12-star/saojingling-agent.git
+cd saojingling-agent
+```
+
+本项目支持**两种**配置方式，任选其一。
+
+**方式 A：`.env` 文件（推荐，本地开发）**
+
+```bash
 cp .env.example .env
 ```
 
-编辑 `.env`，填入你的 API Key：
+然后编辑 `.env`，填入你的 API Key：
 
 ```
 DASHSCOPE_API_KEY=sk-xxxxx
 DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 ```
+
+`.env` 已被 `.gitignore` 忽略，不会被提交；程序启动时由 `utils/env_utils.py` 自动加载。
+
+**方式 B：系统环境变量（适合服务器 / CI）**
+
+不创建 `.env`，直接把 Key 配到系统环境变量即可：
+
+```bash
+# Linux / macOS
+export DASHSCOPE_API_KEY=sk-xxxxx
+export DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+
+# Windows PowerShell
+$env:DASHSCOPE_API_KEY="sk-xxxxx"
+$env:DASHSCOPE_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+```
+
+> 两种方式同时存在时，**系统环境变量优先**（`.env` 只补齐缺失项，不覆盖已有值）。
 
 ### 2. 安装依赖
 
@@ -72,7 +100,7 @@ docker compose up -d
 ├── agent/
 │   ├── react_agent.py        # ReAct Agent + MCP 上下文管理
 │   └── tools/
-│       ├── mcp_server.py     # MCP 工具服务端 (10+ 工具)
+│       ├── mcp_server.py     # MCP 工具服务端 (7 工具)
 │       └── middleware.py     # Agent 中间件 (日志/动态提示词)
 ├── fastapi_app/
 │   ├── main.py               # FastAPI API 端点
@@ -117,9 +145,6 @@ docker compose up -d
 | `price_query` | 产品价格查询 |
 | `image_analyze` | 多模态图片分析 |
 | `export_report` | PDF 报告导出 |
-| `get_user_id` / `get_current_month` | 用户身份/月份获取 |
-| `fetch_external_data` | 用户使用记录查询 |
-| `fill_context_for_report` | 报告生成上下文注入 |
 
 ## 测试
 

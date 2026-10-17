@@ -1,110 +1,111 @@
-# react_agent.py
 import asyncio
-import json
 import os
 import sys
-
-# 📌 将项目根目录注入 sys.path，确保所有项目内导入（model、utils、agent 等）可解析
-current_file = os.path.abspath(__file__)
-project_root = os.path.dirname(os.path.dirname(current_file))  # agent/../ → 项目根目录
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+from utils.path_tool import ensure_project_root_in_syspath
+ensure_project_root_in_syspath()
 
 from typing import AsyncGenerator, List, Dict, Any, Optional
 from model.factory import chat_model
-from utils.prompt_loader import load_system_prompts
-from utils.logger_handler import logger
-from agent.tools.middleware import monitor_tool, log_before_model, report_prompt_switch
+from utils.prompt_loader import load_main_prompts
+from agent.tools.middleware import monitor_tool, log_before_model
 from db.database import get_connection
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
-import mcp.types as types
+from langchain.agents import create_agent
+from langchain_core.messages import HumanMessage, AIMessage
+
 
 
 class ReactMCPContextManager:
-    """MCP 服务端生命周期与工具路由管理器 (全面支持子进程 CWD 隔离与绝对路径固化)"""
+    """MCP 服务端生命周期与工具路由管理器 """
 
-     #cwd 是 current working directory（当前工作目录）的缩写，指当前进程或终端所在的目录路径。
+
     '''
         command — 要执行的程序名（如 "python"、"node"）
         args — 传给该程序的参数列表（如 ["server.py", "--port", "8080"]）
-        cwd — 可选，子进程的工作目录
-        cwd何时传入：不传 cwd 时，子进程继承父进程的当前工作目录（CWD）。args 里的相对路径就是相对于父进程的 CWD 去解析的。
-        我要拉起的进程和我的主进程都在同一个目录下我才不需要传入cwd
+        script_dir — 可选，脚本所在的目录
+        扩展知识：cwd何时传入：不传 cwd 时，子进程继承父进程的当前工作目录（CWD）。args 里的相对路径是相对于子进程的 CWD 解析的。
+        扩展知识：只有当要拉起的进程与主进程在同一目录时，才可以不传 cwd
     '''
-    def __init__(self, command: str, args: List[str], cwd: Optional[str] = None):
+    def __init__(self, command: str, args: List[str], script_dir: Optional[str] = None):
         self.command = command
-        # 📌【核心修复点 1】在初始化时，如果指定了工作目录，强行将 args 里的脚本名转化为绝对路径！
-        # 这样可以彻底避免 Windows 的 [Errno 2] 找不到文件的死结
-        if cwd and args:
-            self.args = [os.path.normpath(os.path.join(cwd, arg)) if not os.path.isabs(arg) else arg for arg in args]
+        # 在初始化时，如果指定了脚本所在的目录，强行将 args 里的脚本名转化为绝对路径！
+        if script_dir and args:
+            self.args = [os.path.normpath(os.path.join(script_dir, arg)) if not os.path.isabs(arg) else arg for arg in args]
+
+            script_path = self.args[0]
+            if not os.path.exists(script_path):
+                print(f"[MCP子进程] 启动失败，文件不存在: {script_path}")
+                self.args = []
         else:
             self.args = args
 
-        self.cwd = cwd
+        self.script_dir = script_dir
         self._client_context = None
         self.session: Optional[ClientSession] = None
         self.llm_tools_schema: List[Dict[str, Any]] = []
 
     async def __aenter__(self):
         """进入上下文：建立 I/O 管道并初始化 MCP 会话"""
+        #把当前进程的全部环境变量复制一份，得到一个新的 dict,不修改原来的环境变量
         current_env = os.environ.copy()
         current_env["PYTHONIOENCODING"] = "utf-8"
-        #子进程 Python 的 sys.path 在没有 PYTHONPATH ，拉起子进程时把 PYTHONPATH 里的路径追加到 sys.path 里。
+
         current_env["PYTHONUTF8"] = "1"
 
-        # 显式注入 PYTHONPATH 确保子进程环境干净
-        if self.cwd:
-            project_root = os.path.dirname(os.path.dirname(self.cwd))
-            current_env["PYTHONPATH"] = os.pathsep.join([project_root, self.cwd, current_env.get("PYTHONPATH", "")])
+        # 显式注入 PYTHONPATH 确保子进程环境干净，
+        # 子进程 Python 的 sys.path 在没有 PYTHONPATH ，拉起子进程时把 PYTHONPATH 里的路径追加到 sys.path 里。
+        if self.script_dir:
+            project_root = os.path.dirname(os.path.dirname(self.script_dir))
+            #PYTHONPATH 是环境变量，作用只有一个：告诉 Python 解释器"除了默认位置，还要去哪些目录找模块
+            current_env["PYTHONPATH"] = os.pathsep.join([project_root, self.script_dir, current_env.get("PYTHONPATH", "")])
 
         # 打印调试日志，让我们在控制台一眼看出拉起的到底是什么绝对路径
-        #' '.join(self.args):用 空格 吧self.args内的东西拼接起来
-        print(f"[底层诊断] 正在拉起子进程命令: {self.command} {' '.join(self.args)}")
-        print(f"[底层诊断] 子进程指定工作目录 (CWD): {self.cwd}")
+        print(f"[底层诊断] 脚本绝对路径: {self.args}")
+        print(f"[底层诊断] 子进程 CWD 将继承父进程: {os.getcwd()}（未通过 Popen 指定）")
 
         server_params = StdioServerParameters(
-            #描述：Python 解释器程序加载并执行 mcp.py 中的代码，启动一个 MCP 进程。
+            #构造 MCP Server 的启动参数（有类型校验的配置对象）
             command=self.command,
             args=self.args,
             env=current_env
         )
 
-        # 建立 Stdio 通信管道
-        '''
-        具体到你这段代码：
-        1. stdio_client(server_params) 内部调用 subprocess.Popen：
-        - command="python" + args=["mcp.py"] → 拉起 python.exe mcp.py 作为子进程
-        - env=current_env → 子进程拿到你配置的编码和 PYTHONPATH
-        2. 操作系统创建两个匿名管道（pipe）：
-        - 输出管道：子进程的 stdout → 连接到父进程的 read_stream。子进程 print() 或 sys.stdout.write() 的内容会流进这个管道，父进程从 read_stream 另一端读
-        - 输入管道：父进程的 write_stream → 连接到子进程的 stdin。父进程向 write_stream 写数据，子进程的 input() 或 sys.stdin.read() 就能收到
-        3. MCP 协议就是在这个双向管道上跑的。父进程往 write_stream 发 JSON 格式的请求（比如 {"method": "tools/list"}），子进程从 stdin 读到后处理，结果打到 stdout，父进程从 read_stream 收到回复。
-        '''
-        #self._client_context:传输层:管理子进程的 stdin/stdout 管道，负责收发原始字节流
+        #stdio_client(server_params)创建一个“负责启动和管理 MCP Server 通信生命周期”的异步上下文管理器对象。
         self._client_context = stdio_client(server_params)
+
+        '''
+        启动 MCP 子进程、准备管道通信资源等操作，底层可能涉及需要等待的系统操作，因此使用异步机制。
+        执行到 await self._client_context.__aenter__() 时，如果 __aenter__() 内部遇到需要等待的异步操作，
+        当前协程会被挂起，让出执行权给事件循环，事件循环可以去处理其他就绪的协程和 I/O 事件。
+        等 __aenter__() 所等待的异步操作完成后，事件循环再从挂起点恢复这个协程，从 await 的位置继续执行，
+        最终拿到 read_stream 和 write_stream。write_stream ──→ 子进程 stdin     （父进程往子进程发送）
+                                            read_stream  ←── 子进程 stdout    （子进程 → 父进程）              
+        '''
+        # 建立 Stdio 通信管道
         read_stream, write_stream = await self._client_context.__aenter__()
 
         # 初始化 MCP 客户端会话
-        #self.session:协议层:在管道之上封装 MCP 协议，把字节流解析成 JSON-RPC 请求/响应
+        '''
+            1. 封包：把 MCP 初始化参数（版本号、客户端能力声明）打包成 JSON-RPC 格式
+            (JSON 本身只规定数据怎么表示,JSON-RPC 要求按照规定的字段组织)
+            2. 写入 write_stream：字符流转字节流进管道，子进程的 stdin 收到
+            3. 读取 read_stream：子进程回复确认，字节流转回 JSON，解析出服务端能力（支持哪些工具、资源等）
+            不是管道解析成 RPC，是两端的代码主动把数据按 RPC 格式打包/解包。
+            管道本身只传原始字节流，没有"解析"能力。
+            4全流程.父进程的 ClientSession 把要发的调用（如 list_tools）打包成 JSON-RPC 格式的字节串，写入管道
+             子进程那边的 MCP 服务器从 stdin 读到字节串，按 JSON-RPC 解析，执行对应功能，把结果再打成 JSON-RPC 字节串写回 stdout
+             父进程的 ClientSession 从管道读到回复，解析成 Python 对象返回给你
+            '''
+        #ClientSession = MCP 协议的客户端实现。它把"裸管道"变成"能用 Python 对象调用的接口"
         self.session = ClientSession(read_stream, write_stream)
         await self.session.__aenter__()
 
         # 协议握手初始化
-        '''
-        1. 封包：把 MCP 初始化参数（版本号、客户端能力声明）打包成 JSON-RPC 格式
-        2. 写入 write_stream：字符流转字节流进管道，子进程的 stdin 收到
-        3. 读取 read_stream：子进程回复确认，字节流转回 JSON，解析出服务端能力（支持哪些工具、资源等）
-        不是管道解析成 RPC，是两端的代码主动把数据按 RPC 格式打包/解包。
-        管道本身只传原始字节流，没有"解析"能力。
-        - 父进程的 ClientSession 把要发的调用（如 list_tools）打包成 JSON-RPC 格式的字节串，写入管道
-        - 子进程那边的 MCP 服务器从 stdin 读到字节串，按 JSON-RPC 解析，执行对应功能，把结果再打成 JSON-RPC 字节串写回 stdout
-        - 父进程的 ClientSession 从管道读到回复，解析成 Python 对象返回给你
-        '''
         await self.session.initialize()
 
         # 动态同步远程工具集，填充完毕self.llm_tools_schema
-        #讲MCP的是 ListToolsResult（FastMCP 内部对象），转换成大模型可以看懂的fucntion calling
+        #将MCP的是 ListToolsResult（FastMCP 内部对象），转换成大模型可以看懂的fucntion calling
         await self._sync_mcp_tools()
         return self
 
@@ -118,15 +119,27 @@ class ReactMCPContextManager:
     async def _sync_mcp_tools(self):
         """拉取 MCP Server 注册的工具，并转化为大模型识别的 Tool Schema"""
         #得到mcp协议的返回格式
-        #mcp_result 是一个 ListToolsResult 对象
+        '''
+        ① ClientSession 打包成 JSON-RPC（在内存里）
+           {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+                ↓ 编码成 UTF-8 字节
+        ② 写进 write_stream → 管道 → 子进程 stdin
+                ↓
+        ③ 子进程（FastMCP）从 stdin 读到，按 JSON-RPC 解析
+           → 遍历所有用 @mcp.tool() 注册的函数
+           → 生成工具清单（name / description / inputSchema）
+                ↓ 打包成响应字节写回 stdout
+        ④ 父进程从 read_stream 读到 → 解码 → 解析
+        ⑤ 返回 ListToolsResult 对象
+        '''
         mcp_result = await self.session.list_tools()
         #Schema 是数据的结构定义，描述数据长什么样、每个字段什么类型、必须传哪些、可选哪些。
         '''
         在 MCP 场景里，子进程把工具的 schema 发给父进程，父进程转给 LLM——LLM 根据 schema 知道"这个函数要怎么调、参数传什么格式"，
         然后生成符合 schema 的调用参数。Schema 就是接口契约，让不同的系统之间知道数据该怎么拼。
         '''
-        #把mcp协议返回的工具格式转换成大模型可以看懂的格式
         self.llm_tools_schema = []
+        # 把mcp协议返回的工具格式ListToolsResult对象转换成大模型可以看懂 OpenAI function-calling 格式
         for tool in mcp_result.tools:
             self.llm_tools_schema.append({
                 "type": "function",
@@ -141,18 +154,31 @@ class ReactMCPContextManager:
         """代为执行外部 服务端工具"""
         if not self.session:
             raise RuntimeError("MCP Session 未建立连接")
+        '''
+        result 不是一个普通字符串，而是 MCP SDK 返回的工具调用结果对象。在你这段代码里，
+        可以把它理解成一个 CallToolResult 对象
+        CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text="工具执行返回的文本"
+            )
+        ],
+        isError=False
+        )
+        '''
         result = await self.session.call_tool(name, arguments)
         #hasattr(obj, name) 是 Python 内置函数，判断对象 obj 有没有叫 name 的属性。有返回 True，没有返回 False。
-        #过滤出纯文本内容
+        #过滤出纯文本内容,这里的遍历等于content= TextContent（），等于实力化，自然可以拿 TextContent里面的属性
         return "".join([content.text for content in result.content if hasattr(content, 'text')])
-    #create mcp tool的必要性
+        #create mcp tool的必要性
 '''
-核心原因：LangChain 和 MCP 不认识彼此的工具格式。
-MCP 工具格式：    @mcp.tool() 装饰器 + JSON Schema 参数
-LangChain 要求：  @langchain_tool() 装饰器 + Pydantic 参数模型
-如果没有 _create_mcp_tool，create_agent() 拿到的就是一堆 JSON Schema 字典，LangChain 根本不知道如何调用它们。
-这个函数做了格式翻译：把 MCP 的工具定义转成 LangChain 的 Tool 对象，Agent 才能正常调度。
-'''
+        核心原因：LangChain 和 MCP 不认识彼此的工具格式。
+        MCP 工具格式：    @mcp.tool() 装饰器 + JSON Schema 参数
+        LangChain 要求：  @langchain_tool() 装饰器 + Pydantic 参数模型
+        如果没有 _create_mcp_tool，create_agent() 拿到的就是一堆 JSON Schema 字典，LangChain 根本不知道如何调用它们。
+        这个函数做了格式翻译：把 MCP 的工具定义转成 LangChain 的 Tool 对象，Agent 才能正常调度。
+        '''
 def  _wrap_as_langchain_tool (mcp_manager: ReactMCPContextManager, name: str, description: str, input_schema: dict):
         """工厂函数：为每个 MCP 工具创建一个 LangChain Tool 对象"""
         from langchain_core.tools import tool as langchain_tool
@@ -167,7 +193,7 @@ def  _wrap_as_langchain_tool (mcp_manager: ReactMCPContextManager, name: str, de
                 py_type = TYPE_MAP.get(prop_info.get("type", "string"), str)
                 default = ... if prop_name in required else None
                 fields[prop_name] = (py_type, Field(default=default, description=prop_info.get("description", "")))
-
+        #** 是字典解包，把字典的每个键值对拆成关键字参数传进去
         args_schema = create_model(f"{name}Arguments", **fields) if fields else None
 
         @langchain_tool(description=description, args_schema=args_schema)
@@ -182,7 +208,7 @@ def  _wrap_as_langchain_tool (mcp_manager: ReactMCPContextManager, name: str, de
 class ReactAgent:
     def __init__(self, session_id: str = "default"):
         self.model = chat_model
-        self.system_prompt = load_system_prompts()
+        self.system_prompt = load_main_prompts()
         self.session_id = session_id
         self.conversation_history: list = []
         self._load_history()
@@ -194,7 +220,6 @@ class ReactAgent:
             (self.session_id,)
         ).fetchall()
         conn.close()
-        from langchain_core.messages import HumanMessage, AIMessage
         self.conversation_history = []
         for row in rows:
             if row["role"] == "human":
@@ -216,8 +241,7 @@ class ReactAgent:
         conn.close()
 
     async def execute_stream(self, query: str, mcp_manager: ReactMCPContextManager) -> AsyncGenerator[str, None]:
-        from langchain.agents import create_agent
-        from langchain_core.messages import HumanMessage, AIMessage
+
         mcp_tools = []
         for tool_schema in mcp_manager.llm_tools_schema:
             name = tool_schema["function"]["name"]
@@ -229,16 +253,62 @@ class ReactAgent:
             self.model,
             mcp_tools,
             system_prompt=self.system_prompt,
-            middleware=[monitor_tool, log_before_model, report_prompt_switch],
+            middleware=[monitor_tool, log_before_model],
         )
 
         messages = list(self.conversation_history)
         messages.append(HumanMessage(content=query))
         inputs = {"messages": messages}
         full = ""
-        async for update in agent.astream(
-            inputs, stream_mode="values", context={"report": False}
-        ):
+        #agent.astream执行流执行过程
+        '''
+        agent.astream(inputs, stream_mode="values")
+  ↓
+第 1 次循环：
+  ├─ system_prompt → main_prompt.txt（create_agent 时固定注入）
+  ├─ @before_model → log_before_model
+  │    日志：即将调用模型，带有 N 条消息
+  ├─ LLM 推理（qwen3-max 看到问题 + 工具列表）
+  ├─ 输出：Thought → "我需要检索本地知识库"
+  ├─ 输出：tool_calls → rag_summarize(query="大户型适合什么")
+  └─ yield update = {"messages": [HumanMessage, ...], "agent": {...}}（决策）
+  ↓
+你的循环体：
+  messages = update.get("messages", [])
+  last = messages[-1]          → AIMessage(tool_calls=[...])
+  last.type == "ai" ✓
+  getattr(last, "tool_calls", None) → 有值！不是 None！ → 不 yield，跳过
+  ↓
+第 2 次循环（引擎自动调工具）：
+  ├─ @wrap_tool_call → monitor_tool
+  │    日志：执行工具 rag_summarize
+  │    调用子进程 → 子进程返回文本
+  │    日志：工具返回结果
+  ├─ 引擎把 ToolMessage 追加到 messages 列表
+  ├─ yield update = {"messages": [..., ToolMessage]}（执行）
+  ↓
+你的循环体：
+  last = messages[-1]          → ToolMessage
+  last.type == "ai" ✗ → 跳过
+  ↓
+第 3 次循环：
+  ├─ system_prompt → main_prompt.txt
+  ├─ @before_model → log_before_model
+  ├─ LLM 推理（看到 ToolMessage 中的工具结果）
+  ├─ 输出：最终回答 "推荐智扫 X3 Ultra，因为..."
+  └─ yield update = {"messages": [..., AIMessage(content="推荐...")]}（回答）
+  ↓
+你的循环体：
+  last = messages[-1]          → AIMessage(content="推荐...")
+  last.type == "ai" ✓
+  getattr(last, "tool_calls", None) → None ✓ → 是最终回答
+  last.content 有内容 ✓
+  full += "推荐智扫 X3 Ultra..."
+  yield "推荐智扫 X3 Ultra..."   ← 这里才往外面（前端）吐数据
+  ↓
+第 4 次循环结束（LLM 无 tool_calls，Agent 停止）
+        '''
+        async for update in agent.astream(inputs, stream_mode="values"):
             messages = update.get("messages", [])
             if messages:
                 last = messages[-1]
@@ -246,6 +316,7 @@ class ReactAgent:
                     if last.content:
                         full += last.content
                         yield last.content
+
         self._save_message("human", query)
         self._save_message("ai", full)
         self.conversation_history.append(HumanMessage(content=query))
@@ -267,7 +338,7 @@ if __name__ == '__main__':
         agent = ReactAgent()
         SERVER_COMMAND = sys.executable
 
-        # 📌【核心修复点 2】使用绝对安全的方式推导绝对路径，不依赖 os.chdir
+
         # 无论从哪个盘符、哪个目录下触发执行该命令，计算出的绝对路径都是死钉在 agent/tools 目录下的
         current_file_abs = os.path.abspath(__file__)
         current_dir_abs = os.path.dirname(current_file_abs)
@@ -277,7 +348,7 @@ if __name__ == '__main__':
 
         print(f"[联调日志] 正在安全拉起 MCP 服务端...")
         async with ReactMCPContextManager(command=SERVER_COMMAND, args=[SERVER_SCRIPT_NAME],
-                                          cwd=tools_dir_abs) as mcp_mgr:
+                                          script_dir=tools_dir_abs) as mcp_mgr:
             query_task = "大户型适合那些扫地机器人"
             print(f"[Client 发起任务]: {query_task}\n[流式响应中]: ")
             async for chunk in agent.execute_stream(query_task, mcp_manager=mcp_mgr):

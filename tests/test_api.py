@@ -1,9 +1,5 @@
-import os
-import sys
+import os, sys
 import pytest
-
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, project_root)
 
 
 class TestFastAPISchemas:
@@ -48,12 +44,15 @@ class TestAgentManager:
 class TestReactAgent:
     def test_react_mcp_context_manager(self):
         from agent.react_agent import ReactMCPContextManager
-        mgr = ReactMCPContextManager("python", ["test.py"], cwd="/tmp")
+        # 签名已改为 (command, args, script_dir=None)，旧用例传的 cwd 已不存在
+        mgr = ReactMCPContextManager("python", ["test.py"])
         assert mgr.command == "python"
         assert mgr.session is None
 
     def test_agent_init(self):
+        import uuid
         from agent.react_agent import ReactAgent
-        agent = ReactAgent()
+        # 用唯一 session_id，避免读到本地历史库导致 conversation_history 非空
+        agent = ReactAgent(session_id="pytest-%s" % uuid.uuid4().hex[:8])
         assert agent.system_prompt is not None
         assert agent.conversation_history == []

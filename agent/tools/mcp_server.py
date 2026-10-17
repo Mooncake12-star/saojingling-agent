@@ -1,26 +1,30 @@
-# mcp_server.py
 import os
 import sys
 '''
 sys.platform      # 'win32'    → 解释器是在什么系统上编译运行的
-sys.path          # 列表       → 解释器去哪找模块
-sys.stdout        # 对象       → 解释器的输出口
-sys.stdin          # 输入口 → Python 从外面收东西
+sys.path          # 列表        → 解释器去哪找模块
+sys.stdout        # 对象        → 解释器的输出口
+sys.stdin         # 输入口      → Python 从外面收东西
 sys.version       # '3.11.5'   → 解释器自己的版本
-sys.argv          # 列表       → 解释器启动时收到的命令行参数
+sys.argv          # 列表        → 解释器启动时收到的命令行参数
 '''
 import urllib.parse   #它是专门用来解析、拆解、拼接和编码 URL（网址）的工具箱。
 import json
 import base64
 from mcp.server.fastmcp import FastMCP
-import requests #专门负责帮你去访问网页、下载数据，或者调用远程的 API 接口
+import requests       #专门负责帮你去访问网页、下载数据，或者调用远程的 API 接口
 import random
 from typing import Optional
+
+#确保项目真正的【工程根目录】被注入到 sys.path 中
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if project_root not in sys.path: sys.path.insert(0, project_root)
+
 from utils.config_handler import agent_conf
 from utils.path_tool import get_abs_path
 from db.database import get_connection
 from cache.redis_client import get_cache, set_cache
-#导包的真实原理：包名为子目录，去python的路径猎列表找根目录，然后进行拼接
+#导包的真实原理：包名为子目录，去python的路径列表找根目录，然后进行拼接
 '''
 你写：
 from utils.config_handler import agent_conf
@@ -38,22 +42,13 @@ Python 去 sys.path 列表里挨个翻：
   "...\\Lib\\utils\\config_handler.py"              ✗ 没有
   "...\\site-packages\\utils\\config_handler.py"    ✗ 没有
 '''
-# 📌 确保项目真正的【工程根目录】被注入到 sys.path 中
-current_dir = os.path.dirname(os.path.abspath(__file__))  # 这是 tools 目录
-agent_dir = os.path.dirname(current_dir)  # 这是 agent 目录
-project_root = os.path.dirname(agent_dir)  # 这是 Agent智扫通项目 根目录
-
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
 
 # 强制固化标准流编码，彻底防止 Windows Stdio 传输中文时的管道闭合异常
-if sys.platform == "win32":  # 1. 判断是不是 Windows 系统
+if sys.platform == "win32":
     import io
-
-    # 2. sys.stdout.buffer → 最底层的二进制输出口（不负责编码，只管吐字节）
-    # io.TextIOWrapper → 在外面套一层"文本→字节"转换器，指定用 utf-8
+    # sys.stdout.buffer → 底层二进制输出口
+    # TextIOWrapper → 包一层 utf-8 编码器，写文本时自动编码为字节
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    # 3. 在外面重新套上一层强力的“UTF-8 文本包装器” (io.TextIOWrapper)
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 # 初始化基础日志兜底
@@ -69,27 +64,25 @@ rag_service = None
 
 try:
     from rag.rag_service import RagSummarizeService
-    from utils.logger_handler import logger as project_logger
+    from utils.logger_handler import logger
 
-    logger = project_logger  # 使用项目统一日志
-
-    # 📌 强行在此处安全实例化，就算 RAG 找不到数据库文件，也只会打印错误，不会导致子进程死掉
+    #强行在此处安全实例化，就算 RAG 找不到数据库文件，也只会打印错误，不会导致子进程死掉
     rag_service = RagSummarizeService()
 
     # 预加载 Reranker 模型（首次加载约 100s），让 API 调用秒级响应
     try:
-        from rag.rag_service import _get_reranker
-        _reranker = _get_reranker()
+        from rag.rag_service import _get_bge_reranker
+        _reranker = _get_bge_reranker()
         if _reranker is not None:
-            logger.info("🎯 [MCP Server] Reranker 模型预加载完成")
+            logger.info("[MCP Server] Reranker 模型预加载完成")
         else:
-            logger.info("ℹ️ [MCP Server] 无 Reranker 模型，使用 LLM 重排序降级方案")
+            logger.info("️[MCP Server] 无 Reranker 模型，使用 LLM 重排序降级方案")
     except Exception as e:
-        logger.warning(f"⚠️ [MCP Server] Reranker 预加载失败，使用惰性加载: {e}")
+        logger.warning(f"[MCP Server] Reranker 预加载失败，调用时再重试: {e}")
 
-    logger.info("🎉 [MCP Server] RagSummarizeService 核心服务成功拉起！")
+    logger.info("[MCP Server] RagSummarizeService 核心服务成功拉起！")
 except Exception as e:
-    logger.error(f"⚠️ [MCP Server 警告] 核心业务组件加载抛出异常，降级无RAG模式运行: {str(e)}")
+    logger.error(f"[MCP Server 警告] 核心业务组件加载抛出异常，降级无RAG模式运行: {str(e)}")
 
 
 # 创建 FastMCP 实例
@@ -117,7 +110,7 @@ def rag_summarize(query: str) -> str:
     try:
         logger.info(f"[MCP Tool] 收到本地知识库检索请求: {query}")
         result = rag_service.rag_summarize(query)
-        set_cache(cache_key, result, ttl=300)  # 缓存 5 分钟
+        set_cache(cache_key, result, ttl=600)  # 缓存 10 分钟
         return result
     except Exception as e:
         logger.error(f"[MCP Tool] 本地检索失败: {str(e)}")
@@ -191,42 +184,10 @@ def get_current_weather(city: str) -> str:
     except Exception as e:
         return f"获取【{city}】天气时发生异常: {str(e)}"
 
-@mcp.tool(name="fill_context_for_report", description="调用后触发中间件自动为报告生成的场景动态注入上下文信息")
-def mcp_fill_context_for_report() -> str:
-    return "fill_context_for_report已调用"
-
-
-@mcp.tool(name="get_user_id", description="获取用户的ID，以纯字符串形式返回")
-def mcp_get_user_id() -> str:
-    return random.choice(["1001", "1002", "1003", "1004", "1005", "1006", "1007", "1008", "1009", "1010"])
-
-
-@mcp.tool(name="get_current_month", description="获取当前月份，以纯字符串形式返回")
-def mcp_get_current_month() -> str:
-    return random.choice(["2025-01", "2025-02", "2025-03", "2025-04", "2025-05", "2025-06",
-                          "2025-07", "2025-08", "2025-09", "2025-10", "2025-11", "2025-12"])
-
-
-@mcp.tool(name="fetch_external_data",
-          description="从外部系统中获取指定用户在指定月份的使用记录，以纯字符串形式返回")
-def mcp_fetch_external_data(user_id: str, month: str) -> str:
-    try:
-        conn = get_connection()
-        row = conn.execute(
-            "SELECT * FROM external_records WHERE user_id = ? AND month = ?",
-            (int(user_id), month)
-        ).fetchone()
-        conn.close()
-
-        if row:
-            return f"用户 {user_id} 在 {month} 的使用记录：{row['record_data']}"
-        return f"未找到用户 {user_id} 在 {month} 的记录"
-    except Exception as e:
-        return f"查询外部数据异常：{str(e)}"
 
 
 # =====================================================================
-# 工具 5: 产品推荐
+# 工具 4: 产品推荐
 # =====================================================================
 def _row_to_product(row):
     """把数据库行转成和原来 JSON 结构一致的 dict"""
@@ -241,7 +202,6 @@ def _row_to_product(row):
         "suitable_for": json.loads(row["suitable_for"]) if row["suitable_for"] else [],
         "rating": row["rating"],
     }
-
 
 @mcp.tool(description="根据用户的户型、预算、需求推荐合适的扫地机器人/扫拖一体机型号，返回推荐结果。")
 def product_recommend(
@@ -316,7 +276,7 @@ def product_recommend(
 
 
 # =====================================================================
-# 工具 6: 价格查询
+# 工具 5: 价格查询
 # =====================================================================
 @mcp.tool(description="查询指定产品的参考价格。返回该产品的官方指导价。")
 def price_query(product_name: str) -> str:
@@ -350,7 +310,7 @@ def price_query(product_name: str) -> str:
 
 
 # =====================================================================
-# 工具 7: 图片分析（多模态）
+# 工具 6: 图片分析（多模态）
 # =====================================================================
 @mcp.tool(description="分析用户上传的故障照片或产品图片，识别问题并给出处理建议。传入图片的本地文件路径。用户上传的图片会保存到 uploads/ 目录下。")
 def image_analyze(file_path: str, question: str = "请分析这张图片中的问题是什么") -> str:
@@ -364,7 +324,7 @@ def image_analyze(file_path: str, question: str = "请分析这张图片中的�
     try:
         import base64
         from dashscope import MultiModalConversation
-        from env_utils import DASHSCOPE_API_KEY
+        from utils.env_utils import DASHSCOPE_API_KEY
 
         with open(file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
@@ -394,7 +354,7 @@ def image_analyze(file_path: str, question: str = "请分析这张图片中的�
 
 
 # =====================================================================
-# 工具 8: 导出报告 PDF
+# 工具 7: 导出报告 PDF
 # =====================================================================
 @mcp.tool(description="将对话分析和产品推荐结果导出为 PDF 报告文件，返回报告文件路径。")
 def export_report(

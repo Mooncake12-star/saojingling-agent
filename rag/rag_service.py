@@ -1,5 +1,5 @@
 """
-企业级 RAG 服务 v2 — 优化版
+RAG 服务
 改进点：
   1. BGE Reranker 替代 LLM 重排序（更稳定、更快、更便宜）
   2. 上下文压缩（阈值过滤 + 长度裁切，降低 token 消耗）
@@ -12,23 +12,13 @@
 依赖已安装，会自动使用 BGE Reranker；
 未安装则降级为 LLM 重排序（原版逻辑），不报错。
 """
-#sys寻包逻辑
-'''
-# 遍历 sys.path 里的每个目录
-for dir in sys.path:
-    # 拼路径：dir + "/utils/config_handler.py"
-    candidate = os.path.join(dir, "utils/config_handler.py")
-    # 检查这个路径存不存在
-    if os.path.exists(candidate):
-        导入它
-'''
-import sys
+
 import os
+import re
+#先看环境变量有没有设置HF_ENDPOINT，如果是空就去原官网，如果有内容，就按设置的内容去找是这个意思吗
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_dir)
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+from utils.path_tool import ensure_project_root_in_syspath
+ensure_project_root_in_syspath()
 
 from typing import List, AsyncGenerator
 from langchain_core.documents import Document
@@ -37,7 +27,7 @@ from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.prompts import PromptTemplate
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
-import logging
+
 
 from rag.vector_store import VectorStoreService
 from utils.prompt_loader import load_rag_prompts
@@ -54,6 +44,22 @@ QUERY_REWRITE_TEMPLATE = """你是检索专家，请根据用户的原始问题�
 - 直接输出改写后的查询，不要多余解释"""
 
 # ──────────────────────────────────────────────
+# 0. BM25 中文分词
+# ──────────────────────────────────────────────
+# BM25Retriever 默认的 preprocess_func 是 text.split()，按空格切词。
+# 中文句子没有空格，整句会被当成一个 token → BM25 检索完全失效（实测
+# 会使混合检索的 Hit@1 比纯向量低 12.5pp）。这里改用字符 bigram（相邻
+# 两字成词），零依赖且对中文有效；若已安装 jieba，可换成
+# preprocess_func=jieba.lcut，效果相当。
+def _cn_preprocess(text: str) -> List[str]:
+    text = re.sub(r"\s+", "", text)
+    if len(text) < 2:
+        ##长度不足2切不出bigram；空串返回 []（而非 [""]）避免产生空 token
+        return [text] if text else []
+    return [text[i:i + 2] for i in range(len(text) - 1)]
+
+
+# ──────────────────────────────────────────────
 # 1. 专业 Reranker — 惰性加载，首次调用时才下载模型
 # ──────────────────────────────────────────────
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
@@ -62,13 +68,16 @@ _RERANKER_INSTANCE = None
 _HAS_BGE_RERANKER = False
 
 try:
+    #CrossEncoder加载模型的接口，先访问本地如果本地没有去huggingface下载
+    #访问的本地文件路径C:\Users\ADMIN\.cache\huggingface\hub
     from sentence_transformers import CrossEncoder
+    #这里为true表示可以尝试加载模型了
     _HAS_BGE_RERANKER = True
 except ImportError:
     logger.warning("[Reranker] sentence-transformers 未安装，降级到 LLM 重排序")
 
 
-def _get_reranker():
+def _get_bge_reranker():
     global _RERANKER_INSTANCE
     global _HAS_BGE_RERANKER
     if _RERANKER_INSTANCE is not None:
@@ -87,10 +96,9 @@ def _get_reranker():
 
 
 class RagSummarizeService:
-    def __init__(self, vector_top_k: int = 10, keyword_top_k: int = 10, final_top_k: int = 6):
+    def __init__(self, keyword_top_k: int = 10, final_top_k: int = 6):
         self.vector_store_svc = VectorStoreService()
         self.model = chat_model
-        self.vector_top_k = vector_top_k
         self.keyword_top_k = keyword_top_k
         self.final_top_k = final_top_k
         self.prompt_text = load_rag_prompts()
@@ -100,13 +108,14 @@ class RagSummarizeService:
         self.chain = self._build_chain()
 
 
-    #给文档打分，然后从高到低按top_k那文档
+    #给文档打分，然后从高到低按top_k拿文档
     def _init_ensemble_retriever(self):
         """初始化集成检索器：向量检索 + BM25 关键词检索"""
         vector_retriever = self.vector_store_svc.get_retriever()
-
         raw_chroma = self.vector_store_svc.vector_store
+
         all_data = raw_chroma.get(include=["documents", "metadatas"])
+        #get("documents", [])如果 all_data 里面不存在 "documents" 这个 key，就返回空列表 []，而不是直接报 KeyError。
         texts = all_data.get("documents", [])
         metadatas = all_data.get("metadatas", [])
 
@@ -119,13 +128,18 @@ class RagSummarizeService:
             Document(page_content=t, metadata=m or {})
             for t, m in zip(texts, metadatas or [{}] * len(texts))
         ]
-        bm25_retriever = BM25Retriever.from_documents(docs)
+        #把docs里的所有 Document 建立成一个 BM25 关键词检索器。
+        #必须显式传 preprocess_func：默认的 text.split() 切不开中文，会让 BM25 失效。
+        bm25_retriever = BM25Retriever.from_documents(docs, preprocess_func=_cn_preprocess)
         bm25_retriever.k = self.keyword_top_k
+        #EnsembleRetriever 同时进行向量检索和 BM25 检索，根据两路结果的排名计算 RRF 分数，
+        #再按照weights=[0.5,0.5]加权融合，重新排序后返回最终 Top 10 个 Chunk。形式是List[Document]
         self.ensemble_retriever = EnsembleRetriever(
             retrievers=[vector_retriever, bm25_retriever],
-            weights=[0.5, 0.5]
+            weights=[0.5, 0.5],
+            k=10
         )
-        logger.info(f"[检索器] EnsembleRetriever 构建完成（向量+BM25），共 {len(docs)} 个文档")
+        logger.info(f"[检索器] EnsembleRetriever 构建完成（向量+BM25），共 {len(docs)} 个文档参与构建集成检索器")
 
     # ──────────────────────────────────────────────
     # 2. BGE Reranker — 比 LLM 打分更稳、更快
@@ -134,19 +148,24 @@ class RagSummarizeService:
         if not docs:
             return docs, []
 
-        reranker_model = _get_reranker()
+        reranker_model = _get_bge_reranker()
         if reranker_model is None:
             return self._llm_rerank(query, docs), []
         pairs = [[query, d.page_content[:512]] for d in docs]
+        #用bge重排给配对的问题+文档chunk打分，BGE到底拿什么“算”出这个相关性分数
+        #它不是计算两个句子的某个固定数学相似度，而是把 query 和 chunk 的 token 一起送进 Transformer，
+        # 通过自注意力/交叉注意力让模型学习两段文本之间的关系，最后通过一个分类/打分层输出相关性分数。
         scores = reranker_model.predict(pairs)
         scores = [float(s) for s in scores]
-
+        #分数归一化
         min_s, max_s = min(scores), max(scores)
         if max_s - min_s > 1e-8:
             scores = [(s - min_s) / (max_s - min_s) for s in scores]
+            #如果相等
         else:
             scores = [0.5] * len(scores)
-
+        #sorted参数要求：1.iterable —— 要排序的数据，2.key —— 按什么规则排序，这里必须是一个函数
+        #3.reverse —— 是否反向排序，最后sorted返回的是一个列表
         scored = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
 
         logger.info(f"[BGE Reranker] 完成 {len(docs)} 个文档评分")
@@ -166,6 +185,7 @@ class RagSummarizeService:
                 "请从高到低给这些文档与问题的相关性打分（0-10分），"
                 "输出格式：每行一个「分数 文档序号」，只输出分数和序号。"
             )
+            #以下是生成器表达式类似列表推到式，从后往前赋值，join的返回值是字符串格式
             docs_text = "\n".join(
                 f"[{i}] {d.page_content[:200]}"
                 for i, d in enumerate(docs)
@@ -174,6 +194,7 @@ class RagSummarizeService:
                 {"query": query, "docs_text": docs_text}
             )
             scored = []
+            #split的返回值是列表
             for line in result.strip().split("\n"):
                 parts = line.strip().split()
                 if len(parts) >= 2:
@@ -197,14 +218,17 @@ class RagSummarizeService:
     # 4. 上下文压缩 — 按分数阈值过滤 + 截断过长内容
     # ──────────────────────────────────────────────
     SCORE_THRESHOLD = 0.3
-    MAX_TOKENS_PER_DOC = 800
+    MAX_CHARS_PER_DOC = 800
 
     def _compress_context(self, docs: List[Document], scores: List[float] = None) -> List[Document]:
         compressed = []
+        if scores is None:
+            logger.debug("[上下文压缩] 无分数信息，仅做长度截断（预期行为：LLM 降级路径）")
         for i, doc in enumerate(docs):
             if scores and scores[i] < self.SCORE_THRESHOLD:
                 continue
-            content = doc.page_content[:self.MAX_TOKENS_PER_DOC]
+
+            content = doc.page_content[:self.MAX_CHARS_PER_DOC]
             compressed.append(Document(page_content=content, metadata=doc.metadata))
         if not compressed:
             return docs[:1]
@@ -214,7 +238,7 @@ class RagSummarizeService:
     # 5. 执行重排序（自动选择方案）
     # ──────────────────────────────────────────────
     def _rerank(self, query: str, docs: List[Document]) -> List[Document]:
-        if _get_reranker() is not None:
+        if _get_bge_reranker() is not None:
             reranked, scores = self._bge_rerank(query, docs)
             compressed = self._compress_context(reranked, scores)
             return compressed
@@ -256,7 +280,7 @@ class RagSummarizeService:
                 logger.warning(f"[查询重写] 失败，使用原始查询: {e}")
                 return inputs["input"]
 
-        def retrieve_and_process(inputs):
+        def retrieve_and_rerank(inputs):
             query = inputs["input"]
             rewritten = inputs["rewritten_query"]
             docs = self.ensemble_retriever.invoke(rewritten)
@@ -267,23 +291,23 @@ class RagSummarizeService:
             return {"input": query, "context": context}
 
         generate_chain = self.prompt_template | self.model | StrOutputParser()
-
+        #RunnableLambda() 就是一个“包装器”，把普通 Python 函数包装成 LangChain 的 Runnable 对象。
+        # RunnablePassthrough.assign保留旧的input并在此基础上添加新的指定字段内容
         return (
             RunnablePassthrough.assign(rewritten_query=RunnableLambda(safe_rewrite))
-            | RunnableLambda(retrieve_and_process)
+            | RunnableLambda(retrieve_and_rerank)
             | generate_chain
         )
-
+    #同步调用
     def rag_summarize(self, query: str) -> str:
         return self.chain.invoke({"input": query})
-
+    #异步调用
     async def astream_rag_summarize(self, query: str) -> AsyncGenerator[str, None]:
         async for chunk in self.chain.astream({"input": query}):
             yield chunk
 
 
 if __name__ == '__main__':
-    from rag.vector_store import VectorStoreService
     vs = VectorStoreService()
     vs.load_document()
 

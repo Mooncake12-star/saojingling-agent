@@ -10,9 +10,8 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+from utils.path_tool import ensure_project_root_in_syspath, get_project_root
+ensure_project_root_in_syspath()
 
 from fastapi_app.schemas import ChatRequest, ChatResponse, StatusResponse
 from fastapi_app.deps import manager
@@ -29,7 +28,7 @@ async def lifespan(app: FastAPI):
 
 #FastAPI 启动时先进入 lifespan，执行 yield 前的代码
 app = FastAPI(
-    title="智扫通 AI Agent",
+    title="扫净灵 AI Agent",
     description="基于 ReAct Agent + RAG + MCP 的智能助手后端服务",
     version="2.0.0",
     lifespan=lifespan,
@@ -107,7 +106,7 @@ async def clear_history():
 
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
-    upload_dir = os.path.join(project_root, "uploads")
+    upload_dir = os.path.join(get_project_root(), "uploads")
     os.makedirs(upload_dir, exist_ok=True)
 
     file_path = os.path.join(upload_dir, file.filename)
@@ -128,7 +127,7 @@ async def upload_image(file: UploadFile = File(...)):
 
 @app.get("/report/{filename}")
 async def download_report(filename: str):
-    reports_dir = os.path.join(project_root, "logs", "reports")
+    reports_dir = os.path.join(get_project_root(), "logs", "reports")
     file_path = os.path.join(reports_dir, filename)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="报告文件不存在")

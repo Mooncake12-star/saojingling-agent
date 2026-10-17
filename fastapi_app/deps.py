@@ -1,8 +1,8 @@
 import asyncio
 import os
 import sys
-from contextlib import asynccontextmanager
-from typing import Optional, Tuple
+
+from typing import Optional
 
 from agent.react_agent import ReactAgent, ReactMCPContextManager
 from rag.vector_store import VectorStoreService
@@ -29,16 +29,11 @@ class AgentManager:
         self._init_knowledge()
 
         # 后台预加载 MCP + Reranker 模型，不阻塞服务器启动
-        asyncio.create_task(self._init_mcp_async())
+        asyncio.create_task(self._init_mcp())
 
         logger.info("[FastAPI] Agent 服务已启动（MCP 后台加载中）")
 
-    async def _init_mcp_async(self):
-        try:
-            await self._init_mcp()
-            logger.info("[FastAPI] MCP 子进程后台加载完成")
-        except Exception as e:
-            logger.error(f"[FastAPI] MCP 后台加载失败: {e}")
+
 
     async def shutdown(self):
         logger.info("[FastAPI] 正在关闭 Agent 服务...")
@@ -67,7 +62,7 @@ class AgentManager:
         server_script_name = "mcp_server.py"
 
         self.mcp_mgr = ReactMCPContextManager(
-            command=SERVER_COMMAND, args=[server_script_name], cwd=server_dir
+            command=SERVER_COMMAND, args=[server_script_name], script_dir=server_dir
         )
 
         try:
@@ -77,7 +72,6 @@ class AgentManager:
         except Exception as e:
             logger.error(f"[FastAPI] MCP 拉起失败: {e}")
             self._mcp_started = False
-            raise
 
     @property
     def is_ready(self) -> bool:

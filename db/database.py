@@ -18,10 +18,14 @@ def get_connection():
     global _INITIALIZED
     db_path = get_db_path()
     conn = sqlite3.connect(db_path)
+    # 让查询结果能按列名访问：row["role"] 而不是 row[1]
     conn.row_factory = sqlite3.Row
+    #让SQLite从"读写互斥"变成"读写并发
     conn.execute("PRAGMA journal_mode=WAL")
     if not _INITIALIZED:
+        # 建表
         _init_db(conn)
+        #灌入初始/产品数据
         _seed_data(conn)
         _INITIALIZED = True
     return conn
@@ -29,6 +33,7 @@ def get_connection():
 
 def _init_db(conn):
     c = conn.cursor()
+    #real：小数类型
     c.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id          TEXT PRIMARY KEY,
@@ -49,21 +54,6 @@ def _init_db(conn):
             role        TEXT NOT NULL,
             content     TEXT,
             created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT NOT NULL,
-            city        TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS external_records (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id     INTEGER,
-            month       TEXT,
-            record_data TEXT
         )
     """)
     conn.commit()
@@ -92,17 +82,3 @@ def _seed_data(conn):
                     p.get("rating", 0)
                 ))
             print(f"[DB] 已导入 {len(products)} 条产品数据")
-
-    # 导入模拟使用记录（仅在首次）
-    count = c.execute("SELECT COUNT(*) FROM external_records").fetchone()[0]
-    if count == 0:
-        sample = [
-            (1, "2026-06", json.dumps({"扫地次数": 22, "平均时长": "45分钟", "耗材": "滚刷正常"}, ensure_ascii=False)),
-            (1, "2026-05", json.dumps({"扫地次数": 18, "平均时长": "40分钟", "耗材": "滚刷正常"}, ensure_ascii=False)),
-            (2, "2026-06", json.dumps({"扫地次数": 15, "平均时长": "30分钟", "耗材": "滤网需更换"}, ensure_ascii=False)),
-        ]
-        for uid, month, data in sample:
-            c.execute("INSERT INTO external_records (user_id, month, record_data) VALUES (?, ?, ?)", (uid, month, data))
-        print("[DB] 已导入模拟使用记录")
-
-    conn.commit()

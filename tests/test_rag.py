@@ -1,9 +1,5 @@
-import os
-import sys
+import os, sys
 import pytest
-
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, project_root)
 
 
 class TestVectorStore:
@@ -11,7 +7,7 @@ class TestVectorStore:
         from rag.vector_store import VectorStoreService
         vs = VectorStoreService()
         assert vs.vector_store is not None
-        assert vs.spliter is not None
+        assert vs.splitter is not None
 
     def test_vector_store_config(self):
         from utils.config_handler import chroma_conf
@@ -30,3 +26,5 @@ class TestRagServiceConfig:
         from utils.prompt_loader import load_rag_prompts
         prompt = load_rag_prompts()
         assert "{context}" in prompt or "{question}" in prompt or "{input}" in prompt
+if __name__ == '__main__':
+    TestRagServiceConfig.test_rag_config()

@@ -33,10 +33,13 @@ jobs:
           python -m py_compile rag/rag_service.py
           python -m py_compile rag/vector_store.py
           python -m py_compile model/factory.py
+          python -m py_compile tests/eval_quick.py
 
       - name: Run tests
         env:
-          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-          DASHSCOPE_BASE_URL: ${{ secrets.DASHSCOPE_BASE_URL }}
+          # 单元测试不发起真实模型调用，仅需一个非空的 api_key 让客户端初始化成功。
+          # 未配置 secret 时回退到占位值，保证 CI 不会因缺少密钥而变红。
+          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY || 'sk-ci-placeholder' }}
+          DASHSCOPE_BASE_URL: ${{ secrets.DASHSCOPE_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1' }}
         run: |
-          pytest tests/ -v --tb=short -x
+          pytest tests/ -v --tb=short

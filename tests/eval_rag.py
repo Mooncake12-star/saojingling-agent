@@ -1,6 +1,6 @@
-import os
-import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import os, sys
+from utils.path_tool import ensure_project_root_in_syspath
+ensure_project_root_in_syspath()
 
 from rag.rag_service import RagSummarizeService
 from model.factory import chat_model

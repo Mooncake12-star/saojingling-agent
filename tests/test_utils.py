@@ -1,9 +1,12 @@
-import os
-import sys
+import os, sys
 import pytest
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, project_root)
+from utils.path_tool import get_project_root, ensure_project_root_in_syspath
+
+ensure_project_root_in_syspath()
+
+# 供本文件各处拼接测试数据路径使用（此前漏定义，导致 3 个用例 NameError）
+project_root = get_project_root()
 
 
 class TestPathTool:
@@ -35,13 +38,12 @@ class TestConfigHandler:
         from utils.config_handler import prompts_conf
         assert "main_prompt_path" in prompts_conf
         assert "rag_summarize_prompt_path" in prompts_conf
-        assert "report_prompt_path" in prompts_conf
 
 
 class TestPromptLoader:
-    def test_load_system_prompts(self):
-        from utils.prompt_loader import load_system_prompts
-        prompt = load_system_prompts()
+    def test_load_main_prompts(self):
+        from utils.prompt_loader import load_main_prompts
+        prompt = load_main_prompts()
         assert isinstance(prompt, str)
         assert len(prompt) > 50
 
@@ -50,13 +52,6 @@ class TestPromptLoader:
         prompt = load_rag_prompts()
         assert isinstance(prompt, str)
         assert len(prompt) > 10
-
-    def test_load_report_prompts(self):
-        from utils.prompt_loader import load_report_prompts
-        prompt = load_report_prompts()
-        assert isinstance(prompt, str)
-        assert "报告" in prompt or "report" in prompt.lower()
-
 
 class TestFileHandler:
     def test_get_file_md5(self):

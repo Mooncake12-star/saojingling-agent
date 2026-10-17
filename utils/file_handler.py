@@ -21,11 +21,12 @@ def get_file_mds_hex(filepath: str):#获取文件的md5的十六进制字符串
              while chunk:=f.read(chunk_size):
                  md5_obj.update(chunk)
              '''
-                chunk = f.read(chunk_size)
-                while chunk:
-
-                 md5_obj.update(chunk)
-                chunk =f.read(chunk_size)      
+             while chunk:=f.read(chunk_size)
+             等价于 
+             while True:
+                 chunk = f.read(chunk_size) 
+             if not chunk: 
+             break    
              '''
 
              md5_hex = md5_obj.hexdigest()
@@ -51,8 +52,20 @@ def listdir_with_allowed_type(path:str,allowed_types:tuple[str]):#返回文件�
     return tuple(files)
 
 def pdf_loader(filepath:str,passwd=None) -> list[Document]:
+    '''
+    Document(
+        page_content="这是文档的具体内容",
+        metadata={"source": "test.txt"}
+    )
+    '''
     #流程：读取每一页内容，将每一页内容封装成一个Document对象，然后再存入列表里
     return PyPDFLoader(filepath,passwd).load()
 
 def txt_loader(filepath:str) -> list[Document]:
     return TextLoader(filepath, encoding='utf-8').load()
+
+
+if __name__ == '__main__':
+    from utils.path_tool import get_project_root
+    docs = txt_loader(os.path.join(get_project_root(), 'data', '扫地机器人100问2.txt'))
+    print(docs[0])

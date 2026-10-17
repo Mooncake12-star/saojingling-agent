@@ -8,8 +8,8 @@ import base64
 from agent.react_agent import ReactAgent, ReactMCPContextManager
 from rag.vector_store import VectorStoreService
 
-st.set_page_config(page_title="智扫通 AI Agent", layout="wide")
-st.title("智扫通 AI Agent 智能助手")
+st.set_page_config(page_title="扫净灵 AI Agent", layout="wide")
+st.title("扫净灵 AI Agent 智能助手")
 
 # ──────────────────────────────────────────────
 #  侧边栏：图片上传 + 报告下载入口
@@ -39,7 +39,7 @@ with st.sidebar:
                 st.download_button("下载最新报告", f, file_name=os.path.basename(report_path))
 
     st.divider()
-    st.caption("智扫通 v2.0 | 技术支持：AI Agent + RAG + MCP")
+    st.caption("扫净灵 v2.0")
 
 
 def _init_knowledge():
@@ -58,7 +58,7 @@ def _init_mcp():
     server_dir = os.path.join(root_dir, "agent", "tools")
     server_script_name = "mcp_server.py"
 
-    mgr = ReactMCPContextManager(command=SERVER_COMMAND, args=[server_script_name], cwd=server_dir)
+    mgr = ReactMCPContextManager(command=SERVER_COMMAND, args=[server_script_name], script_dir=server_dir)
 
     original_cwd = os.getcwd()
     loop = asyncio.new_event_loop()
