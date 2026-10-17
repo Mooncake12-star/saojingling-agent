@@ -37,10 +37,12 @@ jobs:
 
       - name: Run tests
         env:
-          # 单元测试不发起真实模型调用，仅需一个非空的 api_key 让客户端初始化成功。
-          # 未配置 secret 时回退到占位值，保证 CI 不会因缺少密钥而变红。
-          DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY || 'sk-ci-placeholder' }}
-          DASHSCOPE_BASE_URL: ${{ secrets.DASHSCOPE_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1' }}
+          # 单元测试只验证导入与配置结构，不发起真实模型调用，因此固定使用占位值。
+          # 不引用 secrets 的原因：① 仓库未配置 secret 时值为空会导致客户端初始化失败；
+          # ② secret 里粘贴的值可能带不可见字符（空格/制表符），会把 CI 变成假失败；
+          # ③ fork 提交的 PR 拿不到 secrets。
+          DASHSCOPE_API_KEY: 'sk-ci-placeholder'
+          DASHSCOPE_BASE_URL: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
         run: |
           # 用 `python -m pytest` 而非 `pytest`：前者会把当前目录加入 sys.path，
           # 保证 tests/ 下能 import 项目内的 utils/rag/agent 等模块。
