@@ -42,4 +42,7 @@ jobs:
           DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY || 'sk-ci-placeholder' }}
           DASHSCOPE_BASE_URL: ${{ secrets.DASHSCOPE_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1' }}
         run: |
-          pytest tests/ -v --tb=short
+          # 用 `python -m pytest` 而非 `pytest`：前者会把当前目录加入 sys.path，
+          # 保证 tests/ 下能 import 项目内的 utils/rag/agent 等模块。
+          # 项目根的 conftest.py 已做兜底，两种方式都能跑，这里用更稳的一种。
+          python -m pytest tests/ -v --tb=short
