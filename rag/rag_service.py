@@ -31,7 +31,7 @@ from langchain_community.retrievers import BM25Retriever
 
 from rag.vector_store import VectorStoreService
 from utils.prompt_loader import load_rag_prompts
-from model.factory import chat_model
+from model.factory import get_chat_model
 from utils.logger_handler import logger
 
 QUERY_REWRITE_TEMPLATE = """你是检索专家，请根据用户的原始问题和对话历史，生成一个更清晰、更完整的搜索查询。
@@ -98,7 +98,7 @@ def _get_bge_reranker():
 class RagSummarizeService:
     def __init__(self, keyword_top_k: int = 10, final_top_k: int = 6):
         self.vector_store_svc = VectorStoreService()
-        self.model = chat_model
+        self.model = get_chat_model()
         self.keyword_top_k = keyword_top_k
         self.final_top_k = final_top_k
         self.prompt_text = load_rag_prompts()

@@ -5,6 +5,14 @@
 
 基于 **ReAct Agent + RAG + MCP + FastAPI + Redis + SQL** 的智能客服助手，专为扫地机器人/扫拖一体机器人场景打造。
 
+## 项目演示
+
+<!-- TODO(截图)：跑起项目后截图放到 docs/images/ 目录，然后取消下方注释
+![Streamlit 对话界面](docs/images/streamlit-chat.png)
+![Agent 工具调用链路](docs/images/agent-trace.png)
+![PDF 报告导出](docs/images/pdf-report.png)
+-->
+
 ## 技术栈
 
 | 模块 | 技术                                                      |
@@ -151,3 +159,47 @@ docker compose up -d
 ```bash
 pytest tests/ -v
 ```
+
+## 设计取舍
+
+记录几个「为什么这么做」的决策，均有实测依据：
+
+### 1. BM25 中文检索默认是失效的，用字符 bigram 修复
+
+`BM25Retriever` 默认用 `text.split()` 预处理——按空格切词。中文句子没有空格，整句会被当成一个 token，BM25 完全失效。**实测这一默认行为会使混合检索的 Hit@1 比纯向量检索还低 12.5pp**（详见 [评测](#效果评测)）。
+
+修复方案：字符 bigram（相邻两字成词）作为 `preprocess_func`，零额外依赖且对中文有效；若已安装 jieba 可换成 `jieba.lcut`，效果相当。
+
+### 2. 重排序走三级降级，而不是单点依赖
+
+```
+BGE Reranker（CrossEncoder） → 加载失败则 LLM 重排序 → 再失败保持原序
+```
+
+- BGE 比 LLM 重排更稳、更快、零 token 成本；但依赖 sentence-transformers 与模型下载
+- 每一级都有 try/except 兜底，**任何一级失败都不阻断主流程**
+- 重排后接上下文压缩：相关度 < 0.3 的文档直接过滤，单文档截断 800 字符，降低生成阶段 token 消耗
+
+### 3. 模型客户端用惰性单例，import 无副作用
+
+早期版本在 `model/factory.py` 模块顶层直接实例化 `chat_model`——任何模块只要 `from model.factory import ...` 就会立刻创建 HTTP 客户端并校验 API Key。后果：
+
+- 单元测试只想 import 类结构，却被强制初始化真实客户端
+- 环境里没有 API Key 时，连「纯导入」都会失败，CI 无法验证代码结构
+
+现在改为 `get_chat_model()` / `get_embedding_model()`：首次调用才创建，之后复用同一实例。
+
+### 4. MCP 子进程显式注入环境，脚本转绝对路径
+
+stdio 方式拉起 MCP Server 时，子进程默认继承父进程 CWD，相对路径会相对错误的目录解析。处理方式：
+
+- 启动前把 `args` 里的脚本名强制转为绝对路径，并校验文件存在
+- 显式注入 `PYTHONPATH`（项目根 + 工具目录）与 `PYTHONUTF8=1`，保证子进程模块解析和编码与父进程无关
+
+### 5. MCP 工具 schema 动态翻译成 LangChain Tool
+
+MCP 返回的是 JSON Schema 字典，LangChain 需要带 Pydantic 模型的 Tool 对象，两者互不相识。用 `pydantic.create_model` 按 `inputSchema.properties` 动态构建 `args_schema`（含 required→必填、description→Field 描述的映射），每个 MCP 工具在运行时生成对应的 LangChain Tool，**新增工具无需改客户端代码**。
+
+### 6. 配置优先级：系统环境变量 > .env 文件
+
+`load_dotenv(override=False)`：系统环境变量优先，`.env` 只补齐缺失项。本地开发用 `.env`，服务器/CI 用系统变量，两种方式可并存且行为可预期。所有环境变量统一 `strip()` 后使用，防止粘贴时混入的不可见字符穿透到 URL 解析（这个问题在 CI 上真实踩过）。

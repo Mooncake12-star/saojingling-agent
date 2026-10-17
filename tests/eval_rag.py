@@ -3,7 +3,7 @@ from utils.path_tool import ensure_project_root_in_syspath
 ensure_project_root_in_syspath()
 
 from rag.rag_service import RagSummarizeService
-from model.factory import chat_model
+from model.factory import get_chat_model
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
@@ -36,7 +36,7 @@ def evaluate_with_reference(question: str, predicted: str, reference: str) -> di
         "无幻觉: 0/1\n"
         "完整度: 0/1"
     )
-    result = (prompt | chat_model | StrOutputParser()).invoke({
+    result = (prompt | get_chat_model() | StrOutputParser()).invoke({
         "question": question,
         "reference": reference,
         "predicted": predicted

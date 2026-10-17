@@ -276,9 +276,25 @@ def main():
             if rewritten:
                 search_q = rewritten
 
-        vec_docs = vs.vector_store.similarity_search(search_q, k=TOP_K)  # A 纯向量
-        hyb_docs = rag.ensemble_retriever.invoke(search_q)               # B 向量 + BM25
-        bge_docs, _ = rag._bge_rerank(q, hyb_docs)                       # C 混合 + BGE 重排
+        # 带 backoff 的检索：高频调用会触发 embedding/LLM 接口限流（429），
+        # 直接失败会浪费整轮评测；指数退避后重试，最多 4 次
+        def retrieve_with_backoff(fn):
+            for attempt in range(4):
+                try:
+                    return fn()
+                except Exception as e:
+                    if attempt == 3:
+                        raise
+                    wait_s = 15 * (2 ** attempt)
+                    print("    [限流退避] %ds 后重试（第 %d 次）: %s"
+                          % (wait_s, attempt + 1, type(e).__name__))
+                    time.sleep(wait_s)
+
+        vec_docs = retrieve_with_backoff(
+            lambda: vs.vector_store.similarity_search(search_q, k=TOP_K))  # A 纯向量
+        hyb_docs = retrieve_with_backoff(
+            lambda: rag.ensemble_retriever.invoke(search_q))               # B 向量 + BM25
+        bge_docs, _ = rag._bge_rerank(q, hyb_docs)                         # C 混合 + BGE 重排
 
         for key, docs in (("A", vec_docs), ("B", hyb_docs), ("C", bge_docs)):
             for k in (1, 3, 5):

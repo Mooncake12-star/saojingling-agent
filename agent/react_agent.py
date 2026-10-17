@@ -5,7 +5,7 @@ from utils.path_tool import ensure_project_root_in_syspath
 ensure_project_root_in_syspath()
 
 from typing import AsyncGenerator, List, Dict, Any, Optional
-from model.factory import chat_model
+from model.factory import get_chat_model
 from utils.prompt_loader import load_main_prompts
 from agent.tools.middleware import monitor_tool, log_before_model
 from db.database import get_connection
@@ -207,7 +207,7 @@ def  _wrap_as_langchain_tool (mcp_manager: ReactMCPContextManager, name: str, de
 
 class ReactAgent:
     def __init__(self, session_id: str = "default"):
-        self.model = chat_model
+        self.model = get_chat_model()
         self.system_prompt = load_main_prompts()
         self.session_id = session_id
         self.conversation_history: list = []
