@@ -58,6 +58,16 @@ def _init_db(conn):
             created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # 会话摘要：把「超出滑动窗口的旧对话」压成一段摘要，避免历史被硬截断丢掉。
+    # folded_until_id 记录已经折叠到哪条 conversations.id，防止重复折叠。
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS conversation_summary (
+            session_id      TEXT PRIMARY KEY,
+            summary         TEXT,
+            folded_until_id INTEGER DEFAULT 0,
+            updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
 
 

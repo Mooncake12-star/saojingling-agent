@@ -4,6 +4,7 @@ import asyncio
 import os
 import sys
 import base64
+import uuid
 
 from agent.react_agent import ReactAgent, ReactMCPContextManager
 from rag.local_tool import local_rag_summarize
@@ -82,8 +83,12 @@ def _init_mcp():
 # =====================================================================
 #  1. 初始化全局单例
 # =====================================================================
+if "session_id" not in st.session_state:
+    # 每个浏览器会话一个独立 id，避免多人/多标签页共用一个历史
+    st.session_state["session_id"] = f"st-{uuid.uuid4().hex[:12]}"
+
 if "agent" not in st.session_state:
-    st.session_state["agent"] = ReactAgent()
+    st.session_state["agent"] = ReactAgent(session_id=st.session_state["session_id"])
     _init_knowledge()
 
 if "mcp_mgr" not in st.session_state:

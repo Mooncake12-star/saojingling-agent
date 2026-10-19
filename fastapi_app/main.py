@@ -59,11 +59,13 @@ async def health_check():
 #_stream_answer → 下划线开头表示"内部私有函数"，不对外暴露
 #生成器函数（含 yield）：每次执行到 yield 就暂停，把值丢给调用方，自己原地等待下一次被唤醒。
 #sse格式：data: 消息内容\n\n
-async def _stream_answer(query: str, image_path: str | None = None) -> AsyncGenerator[bytes, None]:
+async def _stream_answer(query: str, image_path: str | None = None,
+                         session_id: str | None = None) -> AsyncGenerator[bytes, None]:
     query_text = query
     if image_path and os.path.exists(image_path):
         query_text = f"{query}\n\n[用户已上传图片，文件路径：{image_path}，如需分析图片请使用 image_analyze 工具]"
-    async for chunk in manager.agent.execute_stream(query_text, mcp_manager=manager.mcp_mgr):
+    agent = manager.get_agent(session_id)
+    async for chunk in agent.execute_stream(query_text, mcp_manager=manager.mcp_mgr):
         yield f"data: {chunk}\n\n".encode("utf-8")
     yield "data: [DONE]\n\n".encode("utf-8")
 
@@ -73,7 +75,7 @@ async def chat_stream(body: ChatRequest):
     if not manager.is_ready:
         raise HTTPException(status_code=503, detail="Agent 服务未就绪")
     return StreamingResponse(
-        _stream_answer(body.query, body.image_path),
+        _stream_answer(body.query, body.image_path, body.session_id),
         #— 设置 HTTP 头 Content-Type: text/event-stream，告诉浏览器这是 SSE 流，浏览器 EventSource 解析器才会启动
         media_type="text/event-stream",
         headers={
@@ -92,14 +94,16 @@ async def chat_sync(body: ChatRequest):
     if body.image_path and os.path.exists(body.image_path):
         query_text = f"{body.query}\n\n[用户已上传图片，文件路径：{body.image_path}，如需分析图片请使用 image_analyze 工具]"
     full = ""
-    async for chunk in manager.agent.execute_stream(query_text, mcp_manager=manager.mcp_mgr):
+    async for chunk in manager.get_agent(body.session_id).execute_stream(
+        query_text, mcp_manager=manager.mcp_mgr
+    ):
         full += chunk
     return ChatResponse(answer=full)
 
 
 @app.post("/history/clear")
-async def clear_history():
-    manager.agent.clear_history()
+async def clear_history(session_id: str = "default"):
+    manager.get_agent(session_id).clear_history()
     return {"message": "对话历史已清空"}
 
 

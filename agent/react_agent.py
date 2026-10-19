@@ -9,6 +9,7 @@ from model.factory import get_chat_model
 from utils.prompt_loader import load_main_prompts
 from agent.tools.middleware import monitor_tool, log_before_model
 from db.database import get_connection
+from utils.logger_handler import logger
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from langchain.agents import create_agent
@@ -243,39 +244,123 @@ def  _wrap_as_langchain_tool (mcp_manager: ReactMCPContextManager, name: str, de
 
 
 class ReactAgent:
+    # 滑动窗口：上下文里保留最近几轮原文
+    MAX_HISTORY = 4
+    # 折叠批大小：攒够 4 条（2 轮）才压一次摘要，避免每轮都多花一次 LLM 调用
+    FOLD_BATCH = 4
+
     def __init__(self, session_id: str = "default"):
         self.model = get_chat_model()
         self.system_prompt = load_main_prompts()
         self.session_id = session_id
         self.conversation_history: list = []
+        self.summary: str = ""
+        self._rows: list = []      # 未折叠的消息，元素为 (id, role, content)
         self._load_history()
 
+    # ──────────────────────────────────────────
+    # 记忆：短期=窗口原文，长期=滚动摘要（持久化）
+    # ──────────────────────────────────────────
     def _load_history(self):
         conn = get_connection()
-        rows = conn.execute(
-            "SELECT role, content FROM conversations WHERE session_id = ? ORDER BY id",
+        row = conn.execute(
+            "SELECT summary, folded_until_id FROM conversation_summary WHERE session_id = ?",
             (self.session_id,)
+        ).fetchone()
+        self.summary = (row["summary"] or "") if row else ""
+        folded_until_id = (row["folded_until_id"] or 0) if row else 0
+
+        # 只读「还没折进摘要」的那部分，更早的内容已经在 summary 里了
+        rows = conn.execute(
+            "SELECT id, role, content FROM conversations WHERE session_id = ? AND id > ? ORDER BY id",
+            (self.session_id, folded_until_id)
         ).fetchall()
         conn.close()
-        self.conversation_history = []
-        for row in rows:
-            if row["role"] == "human":
-                self.conversation_history.append(HumanMessage(content=row["content"]))
+
+        self._rows = [(r["id"], r["role"], r["content"]) for r in rows]
+        self._rebuild_window()
+
+    def _rebuild_window(self):
+        """把 _rows 的最近 MAX_HISTORY 轮转成上下文里的消息列表"""
+        recent = self._rows[-(self.MAX_HISTORY * 2):]
+        history = []
+        for _, role, content in recent:
+            if role == "human":
+                history.append(HumanMessage(content=content))
             else:
-                self.conversation_history.append(AIMessage(content=row["content"]))
-        # 只保留最近 4 轮
-        MAX_HISTORY = 4
-        if len(self.conversation_history) > MAX_HISTORY * 2:
-            self.conversation_history = self.conversation_history[-(MAX_HISTORY * 2):]
+                history.append(AIMessage(content=content))
+        self.conversation_history = history
+
+    def _build_system_prompt(self) -> str:
+        """摘要不是原文，单独标注，避免模型把它当成用户刚说的话"""
+        if not self.summary:
+            return self.system_prompt
+        return (
+            f"{self.system_prompt}\n\n"
+            f"### 历史对话摘要（对更早对话的归纳，仅作背景参考，不要原文复述）\n{self.summary}"
+        )
+
+    async def _fold_old_messages(self):
+        """超出窗口的旧对话压成摘要，写进 conversation_summary。
+
+        为什么攒批：每次折叠要一次 LLM 调用，2~5 秒。每轮都折会明显拖慢响应，
+        所以攒够 FOLD_BATCH 条再折一次。
+        """
+        overflow = len(self._rows) - self.MAX_HISTORY * 2
+        if overflow < self.FOLD_BATCH:
+            return
+
+        to_fold = self._rows[:overflow]
+        dialog = "\n".join(
+            f"{'用户' if role == 'human' else '助手'}：{content}"
+            for _, role, content in to_fold
+        )
+        prompt = (
+            "你是对话摘要助手。请把【已有摘要】和【新增对话】合并成一段不超过 200 字的新摘要。\n"
+            "保留用户身份与设备型号、已确认的结论、尚未解决的问题；只做归纳，不要编造，"
+            "不要输出解释或标题。\n\n"
+            f"【已有摘要】\n{self.summary or '（无）'}\n\n"
+            f"【新增对话】\n{dialog}\n"
+        )
+        try:
+            # 同步调用丢线程池，不能阻塞事件循环
+            resp = await asyncio.to_thread(self.model.invoke, prompt)
+            new_summary = (getattr(resp, "content", "") or "").strip()
+        except Exception as e:
+            # 摘要失败不影响主流程：原文还在库里，下次再折
+            logger.warning(f"[Memory] 摘要生成失败，跳过本轮折叠: {e}")
+            return
+
+        if not new_summary:
+            return
+
+        folded_until_id = to_fold[-1][0]
+        conn = get_connection()
+        conn.execute(
+            "INSERT INTO conversation_summary (session_id, summary, folded_until_id, updated_at) "
+            "VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "summary = excluded.summary, folded_until_id = excluded.folded_until_id, updated_at = CURRENT_TIMESTAMP",
+            (self.session_id, new_summary, folded_until_id)
+        )
+        conn.commit()
+        conn.close()
+
+        self.summary = new_summary
+        self._rows = self._rows[overflow:]
+        self._rebuild_window()
+        logger.info(f"[Memory] 已折叠 {len(to_fold)} 条旧消息进摘要（session={self.session_id}）")
 
     def _save_message(self, role: str, content: str):
         conn = get_connection()
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO conversations (session_id, role, content) VALUES (?, ?, ?)",
             (self.session_id, role, content)
         )
         conn.commit()
         conn.close()
+        # 同步进内存，避免下一轮再查库
+        self._rows.append((cur.lastrowid, role, content))
 
     async def execute_stream(self, query: str, mcp_manager: ReactMCPContextManager) -> AsyncGenerator[str, None]:
 
@@ -289,7 +374,8 @@ class ReactAgent:
         agent = create_agent(
             self.model,
             mcp_tools,
-            system_prompt=self.system_prompt,
+            # 先把摘要拼进系统提示词：窗口外的旧对话靠它保留，而不是被丢掉
+            system_prompt=self._build_system_prompt(),
             middleware=[monitor_tool, log_before_model],
         )
 
@@ -356,16 +442,17 @@ class ReactAgent:
 
         self._save_message("human", query)
         self._save_message("ai", full)
-        self.conversation_history.append(HumanMessage(content=query))
-        self.conversation_history.append(AIMessage(content=full))
-        MAX_HISTORY = 4
-        if len(self.conversation_history) > MAX_HISTORY * 2:
-            self.conversation_history = self.conversation_history[-(MAX_HISTORY * 2):]
+        self._rebuild_window()
+        # 超出窗口的旧对话压进摘要（攒够一批才压一次，避免每轮多花一次 LLM 调用）
+        await self._fold_old_messages()
 
     def clear_history(self):
         self.conversation_history.clear()
+        self.summary = ""
+        self._rows = []
         conn = get_connection()
         conn.execute("DELETE FROM conversations WHERE session_id = ?", (self.session_id,))
+        conn.execute("DELETE FROM conversation_summary WHERE session_id = ?", (self.session_id,))
         conn.commit()
         conn.close()
 

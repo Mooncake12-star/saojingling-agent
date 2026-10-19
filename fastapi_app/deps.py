@@ -14,18 +14,36 @@ from db.database import get_connection
 class AgentManager:
     """管理 Agent 和 MCP 子进程的生命周期"""
 
+    # 最多同时缓存多少个会话的 Agent，超出按最早创建淘汰，防止长期运行内存无限涨
+    MAX_SESSIONS = 200
+
     def __init__(self):
         self.agent: Optional[ReactAgent] = None
         self.mcp_mgr: Optional[ReactMCPContextManager] = None
         self._mcp_started = False
         self._rag_ready = False
+        self._agents: dict[str, ReactAgent] = {}
+
+    def get_agent(self, session_id: Optional[str] = None) -> ReactAgent:
+        """按会话取 Agent：每个 session 一份独立历史，不再全站共用 "default"。"""
+        sid = (session_id or "").strip() or "default"
+        agent = self._agents.get(sid)
+        if agent is None:
+            if len(self._agents) >= self.MAX_SESSIONS:
+                oldest = next(iter(self._agents))
+                self._agents.pop(oldest, None)
+                logger.info(f"[FastAPI] 会话数超上限，淘汰最旧会话: {oldest}")
+            agent = ReactAgent(session_id=sid)
+            self._agents[sid] = agent
+            logger.info(f"[FastAPI] 新建会话: {sid}")
+        return agent
 
     async def startup(self):
         logger.info("[FastAPI] 正在启动 Agent 服务...")
         # 初始化 SQLite 数据库（自动建表 + 导入产品数据）
         get_connection()
         logger.info("[FastAPI] SQLite 数据库已初始化")
-        self.agent = ReactAgent()
+        self.agent = self.get_agent("default")
         # 把 data/ 下的知识库文件加载到 ChromaDB（快速，不影响启动）
         self._init_knowledge()
 
