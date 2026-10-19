@@ -6,6 +6,7 @@ import sys
 import base64
 
 from agent.react_agent import ReactAgent, ReactMCPContextManager
+from rag.local_tool import local_rag_summarize
 from rag.vector_store import VectorStoreService
 
 st.set_page_config(page_title="扫净灵 AI Agent", layout="wide")
@@ -59,6 +60,10 @@ def _init_mcp():
     server_script_name = "mcp_server.py"
 
     mgr = ReactMCPContextManager(command=SERVER_COMMAND, args=[server_script_name], script_dir=server_dir)
+    # RAG 检索回落到主进程执行：工具定义仍由 MCP 提供（对大模型透明），
+    # 但不让子进程重复加载一份 BGE 重排模型（约 1.5GB），否则 8GB 内存的
+    # 机器会被打进重度换页，表现为 rag_summarize 永久卡死。
+    mgr.register_local_tool("rag_summarize", local_rag_summarize)
 
     original_cwd = os.getcwd()
     loop = asyncio.new_event_loop()

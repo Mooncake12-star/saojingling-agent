@@ -1,52 +1,14 @@
 import asyncio
 import os
 import sys
-import threading
 
 from typing import Optional
 
 from agent.react_agent import ReactAgent, ReactMCPContextManager
+from rag.local_tool import local_rag_summarize
 from rag.vector_store import VectorStoreService
 from utils.logger_handler import logger
 from db.database import get_connection
-
-
-# ──────────────────────────────────────────────
-# 进程内 RAG 单例
-# ──────────────────────────────────────────────
-# 为什么要放在主进程而不是 MCP 子进程里：
-# MCP 子进程要实现 rag_summarize 就得自己 import torch + transformers 并加载
-# BGE 重排模型，占 1.5GB 左右；主进程这边已经加载了向量库。8GB 机器上两份
-# 叠加会把系统打进重度换页，子进程直接被换出成"假死"。所以模型全系统只留一份，
-# 放在主进程，MCP 侧只保留工具定义。
-_rag_service = None
-_rag_lock = threading.Lock()
-
-
-def get_rag_service():
-    """惰性创建 RAG 服务（首次检索时才加载重排模型，约 40~60 秒）。"""
-    global _rag_service
-    if _rag_service is not None:
-        return _rag_service
-    with _rag_lock:
-        if _rag_service is None:
-            from rag.rag_service import RagSummarizeService
-            logger.info("[FastAPI] 首次检索请求，正在初始化 RAG 服务（加载重排模型）...")
-            _rag_service = RagSummarizeService()
-            logger.info("[FastAPI] RAG 服务初始化完成")
-    return _rag_service
-
-
-def local_rag_summarize(arguments: dict) -> str:
-    """rag_summarize 的本地实现（由 Agent 在自己的线程池里调用）。"""
-    query = (arguments or {}).get("query", "")
-    if not query:
-        return "参数错误：缺少 query 字段"
-    try:
-        return get_rag_service().rag_summarize(query)
-    except Exception as e:
-        logger.error(f"[FastAPI] 本地 RAG 检索失败: {e}")
-        return f"知识库检索失败：{e}"
 
 
 class AgentManager:
