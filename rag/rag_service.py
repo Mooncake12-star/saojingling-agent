@@ -65,16 +65,33 @@ def _cn_preprocess(text: str) -> List[str]:
 RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 
 _RERANKER_INSTANCE = None
-_HAS_BGE_RERANKER = False
+# None = 还没探测过；True/False = 探测结果。
+# 注意不要在这里 import sentence_transformers：它会把 torch + transformers
+# 一起拖进来（实测约 38 秒、占用 1.5GB+ 内存）。任何"只是想用向量检索"的
+# 进程（例如 MCP 子进程）不应该为它付这个代价。
+_HAS_BGE_RERANKER = None
 
-try:
-    #CrossEncoder加载模型的接口，先访问本地如果本地没有去huggingface下载
-    #访问的本地文件路径C:\Users\ADMIN\.cache\huggingface\hub
-    from sentence_transformers import CrossEncoder
-    #这里为true表示可以尝试加载模型了
-    _HAS_BGE_RERANKER = True
-except ImportError:
-    logger.warning("[Reranker] sentence-transformers 未安装，降级到 LLM 重排序")
+
+def _local_snapshot_dir(repo_id: str):
+    """在 HuggingFace 缓存里找已下载的模型快照目录，找不到返回 None。
+
+    为什么要这么绕：sentence-transformers 5.x 即使传 local_files_only=True，
+    仍会去校验仓库元数据（实测 hf-mirror 返回 502 时整个加载直接失败）。
+    直接把本地快照目录当"路径"传进去，hf 侧就不会发起任何网络请求——
+    断网、镜像站抖动都不影响。
+    """
+    hf_home = os.getenv("HF_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
+    snapshots = os.path.join(hf_home, "hub", "models--" + repo_id.replace("/", "--"), "snapshots")
+    if not os.path.isdir(snapshots):
+        return None
+    candidates = [
+        os.path.join(snapshots, name)
+        for name in os.listdir(snapshots)
+        if os.path.isfile(os.path.join(snapshots, name, "config.json"))
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=os.path.getmtime)
 
 
 def _get_bge_reranker():
@@ -82,12 +99,29 @@ def _get_bge_reranker():
     global _HAS_BGE_RERANKER
     if _RERANKER_INSTANCE is not None:
         return _RERANKER_INSTANCE
-    if not _HAS_BGE_RERANKER:
+    if _HAS_BGE_RERANKER is False:
         return None
 
     try:
-        _RERANKER_INSTANCE = CrossEncoder(RERANKER_MODEL_NAME)
-        logger.info(f"[Reranker] 已加载模型: {RERANKER_MODEL_NAME}")
+        #CrossEncoder加载模型的接口，先访问本地如果本地没有去huggingface下载
+        #访问的本地文件路径C:\Users\ADMIN\.cache\huggingface\hub
+        from sentence_transformers import CrossEncoder
+    except ImportError:
+        _HAS_BGE_RERANKER = False
+        logger.warning("[Reranker] sentence-transformers 未安装，降级到 LLM 重排序")
+        return None
+
+    _HAS_BGE_RERANKER = True
+    try:
+        # 先走本地快照（完全不联网），没有缓存再按仓库名联网下载
+        local_dir = _local_snapshot_dir(RERANKER_MODEL_NAME)
+        if local_dir:
+            _RERANKER_INSTANCE = CrossEncoder(local_dir)
+            logger.info(f"[Reranker] 已从本地缓存加载模型: {local_dir}")
+        else:
+            logger.info("[Reranker] 本地无缓存，开始在线下载")
+            _RERANKER_INSTANCE = CrossEncoder(RERANKER_MODEL_NAME)
+            logger.info(f"[Reranker] 已加载模型: {RERANKER_MODEL_NAME}")
         return _RERANKER_INSTANCE
     except Exception as e:
         logger.warning(f"[Reranker] 模型加载失败，降级到 LLM 重排序: {e}")

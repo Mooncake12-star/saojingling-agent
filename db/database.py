@@ -1,5 +1,7 @@
 import sqlite3
 import json
+
+from utils.logger_handler import logger
 import os
 
 DB_PATH = None
@@ -81,4 +83,4 @@ def _seed_data(conn):
                     json.dumps(p.get("suitable_for", []), ensure_ascii=False),
                     p.get("rating", 0)
                 ))
-            print(f"[DB] 已导入 {len(products)} 条产品数据")
+            logger.info(f"[DB] 已导入 {len(products)} 条产品数据")

@@ -2,6 +2,8 @@ import os
 #socket：Python 内置的网络通信标准库，提供底层网络接口。这里用它做 端口探活
 import socket
 
+from utils.logger_handler import logger
+
 _redis = None
 _ENABLED = False
 _CHECKED = False
@@ -42,15 +44,15 @@ def _init():
     host = os.getenv("REDIS_HOST", "localhost")
     port = int(os.getenv("REDIS_PORT", 6379))
     if not _check_port_open(host, port):
-        print("[Cache] Redis 未启动，缓存已降级（跳过）")
+        logger.warning("[Cache] Redis 未启动，缓存已降级（跳过）")
         return
     try:
         _redis = redis.Redis(host=host, port=port, socket_connect_timeout=2, decode_responses=True)
         _redis.ping()
         _ENABLED = True
-        print("[Cache] Redis 已连接")
+        logger.info("[Cache] Redis 已连接")
     except Exception:
-        print("[Cache] Redis 连接失败，缓存已降级（跳过）")
+        logger.warning("[Cache] Redis 连接失败，缓存已降级（跳过）")
 
 
 def get_cache(key: str) -> str | None:

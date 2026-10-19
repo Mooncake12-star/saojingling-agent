@@ -1,1 +1,4 @@
 external_data_path: data/external/records.csv
+# 多模态（图片分析）型号：DashScope 会定期下线旧型号，放配置里便于随时替换
+# 可选值参考：qwen3-vl-plus / qwen-vl-max-latest（需在百炼控制台开通）
+vl_model_name: qwen3-vl-plus

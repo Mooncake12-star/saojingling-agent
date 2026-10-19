@@ -57,36 +57,45 @@ import logging
 logger = logging.getLogger("MCP_Server")
 logger.setLevel(logging.INFO)
 
+# 统一使用项目日志（控制台 INFO / 文件 DEBUG），覆盖上面的临时 logger
+from utils.logger_handler import logger
+
 # =====================================================================
-#  全局初始化隔离：防止 RagSummarizeService 报错导致整站闪退
+#  RAG 服务惰性初始化
+#
+#  为什么不在这里直接实例化（原来的写法）：
+#  stdio 模式下，本进程必须先进入 mcp.run() 开始读 stdin，客户端才能握手。
+#  而 RagSummarizeService 构建 BM25 索引（328 文档）+ 预加载 BGE 模型（393 层）
+#  需要约 90 秒，全部发生在进入 mcp.run() 之前 —— 客户端握手会一直等，
+#  表现为 /health 长时间 degraded、Agent 手里没有任何工具。
+#  改为首次调用 rag_summarize 时才构建：启动 3~5 秒，代价是第一次检索慢。
 # =====================================================================
-rag_service = None
+rag_service = None          # 兼容旧引用：初始化成功后指向服务实例
+_rag_init_failed = False    # 初始化失败后不再重试，避免每次请求都卡一遍
 
-try:
-    from rag.rag_service import RagSummarizeService
-    from utils.logger_handler import logger
 
-    #强行在此处安全实例化，就算 RAG 找不到数据库文件，也只会打印错误，不会导致子进程死掉
-    rag_service = RagSummarizeService()
+def _get_rag_service():
+    """惰性构建 RAG 服务；失败只记日志并降级，不拖垮整个 MCP 进程"""
+    global rag_service, _rag_init_failed
 
-    # 预加载 Reranker 模型（首次加载约 100s），让 API 调用秒级响应
+    if rag_service is not None or _rag_init_failed:
+        return rag_service
+
     try:
-        from rag.rag_service import _get_bge_reranker
-        _reranker = _get_bge_reranker()
-        if _reranker is not None:
-            logger.info("[MCP Server] Reranker 模型预加载完成")
-        else:
-            logger.info("️[MCP Server] 无 Reranker 模型，使用 LLM 重排序降级方案")
-    except Exception as e:
-        logger.warning(f"[MCP Server] Reranker 预加载失败，调用时再重试: {e}")
+        from rag.rag_service import RagSummarizeService
 
-    logger.info("[MCP Server] RagSummarizeService 核心服务成功拉起！")
-except Exception as e:
-    logger.error(f"[MCP Server 警告] 核心业务组件加载抛出异常，降级无RAG模式运行: {str(e)}")
+        logger.info("[MCP Server] 首次检索请求，正在初始化 RAG 服务（BM25 索引 + Reranker，首次较慢）...")
+        rag_service = RagSummarizeService()
+        logger.info("[MCP Server] RAG 服务初始化完成")
+    except Exception as e:
+        _rag_init_failed = True
+        logger.error(f"[MCP Server] RAG 服务初始化失败，降级无 RAG 模式: {e}")
+
+    return rag_service
 
 
 # 创建 FastMCP 实例
-mcp = FastMCP("ZhiSaoTong-Core-Service")
+mcp = FastMCP("扫净灵-Core-Service")
 
 # =====================================================================
 # 工具 1: 本地 RAG 知识库检索
@@ -97,8 +106,9 @@ def rag_summarize(query: str) -> str:
     通过本地知识库回答问题
     :param query: 用户的查询疑问
     """
-    if not rag_service:
-        return "⚠️ 错误：本地 RAG 服务由于内部路径或向量库加载异常未能成功就绪。"
+    svc = _get_rag_service()
+    if svc is None:
+        return "⚠️ 错误：本地 RAG 服务初始化失败（向量库或模型加载异常），本次无法检索知识库。"
 
     # 先查缓存
     cache_key = f"rag:{query}"
@@ -109,7 +119,7 @@ def rag_summarize(query: str) -> str:
 
     try:
         logger.info(f"[MCP Tool] 收到本地知识库检索请求: {query}")
-        result = rag_service.rag_summarize(query)
+        result = svc.rag_summarize(query)
         set_cache(cache_key, result, ttl=600)  # 缓存 10 分钟
         return result
     except Exception as e:
@@ -339,14 +349,17 @@ def image_analyze(file_path: str, question: str = "请分析这张图片中的�
                 {"text": question}
             ]
         }]
+        # 型号放配置里：DashScope 会下线旧型号（qwen-vl-max 已 404 Model not exist）
+        vl_model = agent_conf.get("vl_model_name", "qwen3-vl-plus")
         response = MultiModalConversation.call(
-            model="qwen-vl-max",
+            model=vl_model,
             messages=messages,
             api_key=DASHSCOPE_API_KEY
         )
         if response.status_code == 200:
             return response.output.choices[0].message.content[0]["text"]
-        return f"图片分析失败：{response.message}"
+        # 带上错误码，便于区分「型号不存在」与「账号额度/权限」两类问题
+        return f"图片分析失败（{getattr(response, 'code', '')}）：{getattr(response, 'message', '')}"
     except ImportError:
         return "图片分析功能不可用：缺少 dashscope 依赖"
     except Exception as e:
@@ -395,7 +408,7 @@ def export_report(
                 pdf.ln(2)
         else:
             pdf.set_font("Helvetica", "", 16)
-            pdf.cell(0, 15, "[ZhiSaoTong Report]", align="C")
+            pdf.cell(0, 15, "[saojingling Report]", align="C")
             pdf.ln(20)
             pdf.set_font("Helvetica", "", 10)
             pdf.cell(0, 10, f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")

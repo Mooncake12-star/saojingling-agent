@@ -44,6 +44,10 @@ class ReactMCPContextManager:
         self._client_context = None
         self.session: Optional[ClientSession] = None
         self.llm_tools_schema: List[Dict[str, Any]] = []
+        # 本地优先的工具实现：{工具名: callable(arguments: dict) -> str}
+        # MCP 子进程只负责"提供工具定义 + 协议适配"，重计算能力若主进程已有，
+        # 就直接在主进程执行，避免子进程重复加载模型（见 register_local_tool）
+        self.local_tools: Dict[str, Any] = {}
 
     async def __aenter__(self):
         """进入上下文：建立 I/O 管道并初始化 MCP 会话"""
@@ -102,11 +106,23 @@ class ReactMCPContextManager:
         await self.session.__aenter__()
 
         # 协议握手初始化
-        await self.session.initialize()
+        # 必须设超时：子进程若在 import 阶段做耗时初始化、或直接崩溃不响应，
+        # initialize() 会无限等待，日志上既不报错也不成功（只能看到"卡住"）。
+        MCP_HANDSHAKE_TIMEOUT = 180  # 秒
+        try:
+            await asyncio.wait_for(self.session.initialize(), timeout=MCP_HANDSHAKE_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"MCP 握手超时（>{MCP_HANDSHAKE_TIMEOUT}s）：子进程未响应。"
+                f"请检查 mcp_server.py 是否在 import 阶段做了耗时初始化。"
+            )
 
         # 动态同步远程工具集，填充完毕self.llm_tools_schema
         #将MCP的是 ListToolsResult（FastMCP 内部对象），转换成大模型可以看懂的fucntion calling
-        await self._sync_mcp_tools()
+        try:
+            await asyncio.wait_for(self._sync_mcp_tools(), timeout=60)
+        except asyncio.TimeoutError:
+            raise RuntimeError("MCP 工具列表拉取超时（>60s）：服务端未响应 tools/list")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -150,8 +166,29 @@ class ReactMCPContextManager:
                 }
             })
 
+    def register_local_tool(self, name: str, func) -> None:
+        """把某个 MCP 工具的实现改为"本地优先"。
+
+        背景（真实踩坑）：RAG 工具原本只在 MCP 子进程里执行，子进程为此要
+        单独 import torch / transformers 并加载 BGE 重排模型（约 1.5GB、40s+）。
+        主进程（FastAPI）里本来就有一份向量库和模型，8GB 内存的机器上两份叠
+        加会把系统打进换页，子进程工作集被换出到几 MB，表现为"调用永久卡死"
+        ——不是死锁，是没有内存可用。
+
+        所以：工具定义仍由 MCP 提供（对大模型完全透明），但实现回落到主进程
+        已有的单例，全系统只保留一份模型。
+        """
+        self.local_tools[name] = func
+
     async def call_mcp_tool(self, name: str, arguments: Dict[str, Any]) -> str:
         """代为执行外部 服务端工具"""
+        # 本地优先：主进程内已有实现就不再跨进程调用（省一份模型的内存和时间）
+        local_impl = self.local_tools.get(name)
+        if local_impl is not None:
+            # 这类实现是同步阻塞的（模型推理可能几十秒），必须丢线程池，
+            # 否则会卡死 FastAPI 的事件循环，整个服务都失去响应。
+            return await asyncio.to_thread(local_impl, arguments)
+
         if not self.session:
             raise RuntimeError("MCP Session 未建立连接")
         '''
