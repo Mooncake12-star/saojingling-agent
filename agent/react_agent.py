@@ -111,7 +111,9 @@ class ReactMCPContextManager:
         # 协议握手初始化
         # 必须设超时：子进程若在 import 阶段做耗时初始化、或直接崩溃不响应，
         # initialize() 会无限等待，日志上既不报错也不成功（只能看到"卡住"）。
-        MCP_HANDSHAKE_TIMEOUT = 40  # 秒
+        # 90 秒而不是 40：容器里冷启动时子进程 import 与宿主进程可能存在
+        # CPU 竞争，实测本机 3s 的握手在受限容器里可能翻数倍，留足余量。
+        MCP_HANDSHAKE_TIMEOUT = 90  # 秒
         try:
             await asyncio.wait_for(self.session.initialize(), timeout=MCP_HANDSHAKE_TIMEOUT)
         except asyncio.TimeoutError:

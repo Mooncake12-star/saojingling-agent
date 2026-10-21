@@ -10,7 +10,7 @@
 """
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ChatRequest(BaseModel):
@@ -22,6 +22,17 @@ class ChatRequest(BaseModel):
     # 不传则检索「自己的文档 + 内置公共资料」——不是全库，全库会跨用户泄漏。
     # 归属仍由 token 校验：传别人的 kb_id 会得到 404，不是 403。
     knowledge_base_id: int | None = None
+
+    @field_validator("knowledge_base_id")
+    @classmethod
+    def _zero_or_negative_means_none(cls, v: int | None) -> int | None:
+        """把 0 / 负数归一成「不指定知识库」。
+
+        Swagger 示例默认填 0，而 0 不是合法的库 ID——直接透传会走到
+        「校验库归属」逻辑，返回 404「知识库不存在」，用户会误以为
+        服务有毛病。归一以后 0 与不传等价，全局检索照常工作。
+        """
+        return v if v and v > 0 else None
 
 
 class ChatResponse(BaseModel):

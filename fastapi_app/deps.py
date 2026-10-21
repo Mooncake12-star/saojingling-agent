@@ -70,9 +70,11 @@ class AgentManager:
         # 把 data/ 下的知识库文件加载到 ChromaDB（快速，不影响启动）
         self._init_knowledge()
 
-        # 后台预加载 MCP + Reranker 模型 + RAG 服务，不阻塞服务器启动
-        asyncio.create_task(self._init_mcp())
-        asyncio.create_task(self._warmup())
+        # 后台预热 Reranker 模型 + RAG 服务，完成后再拉 MCP 子进程。
+        # 顺序不能反：MCP 子进程自身的 import 要占几秒 CPU，如果和 torch
+        # 模型加载（把核吃满 40 秒+）同时跑，容器里子进程会被饿到超过
+        # 握手超时——真实发生过：容器首启 MCP 握手 40s 超时、/readyz 卡 503。
+        asyncio.create_task(self._warmup_then_mcp())
 
         logger.info(
             "[FastAPI] Agent 服务已启动（MCP / 重排模型后台加载中）",
@@ -105,6 +107,11 @@ class AgentManager:
             extra={"context": {"event": "app.warmup", "ok": ok,
                                "cost_s": round(time.perf_counter() - started, 2)}},
         )
+
+    async def _warmup_then_mcp(self) -> None:
+        """先预热（模型加载是 CPU 大户），完成后再拉 MCP 子进程。"""
+        await self._warmup()
+        await self._init_mcp()
 
     @staticmethod
     def _warmup_blocking() -> bool:
@@ -153,13 +160,21 @@ class AgentManager:
         # 但不再让子进程重复加载一份重排模型（省 1.5GB + 40s）。
         self.mcp_mgr.register_local_tool("rag_summarize", local_rag_summarize)
 
-        try:
-            await self.mcp_mgr.__aenter__()
-            self._mcp_started = True
-            logger.info("[FastAPI] MCP 子进程已拉起")
-        except Exception as e:
-            logger.error(f"[FastAPI] MCP 拉起失败: {e}")
-            self._mcp_started = False
+        # 最多重试 3 次：子进程拉起依赖时序（CPU 竞争、冷缓存），
+        # 一次失败不等于永远失败，不该让整个进程只能靠重启自愈。
+        for attempt in range(1, 4):
+            try:
+                await self.mcp_mgr.__aenter__()
+                self._mcp_started = True
+                logger.info("[FastAPI] MCP 子进程已拉起")
+                break
+            except Exception as e:  # noqa: BLE001
+                self._mcp_started = False
+                if attempt == 3:
+                    logger.error(f"[FastAPI] MCP 拉起失败（已重试 3 次）: {e}")
+                else:
+                    logger.warning(f"[FastAPI] MCP 拉起失败（第 {attempt} 次），10s 后重试: {e}")
+                    await asyncio.sleep(10)
 
     @property
     def is_ready(self) -> bool:
