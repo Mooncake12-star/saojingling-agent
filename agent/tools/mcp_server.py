@@ -9,7 +9,6 @@ sys.version       # '3.11.5'   → 解释器自己的版本
 sys.argv          # 列表        → 解释器启动时收到的命令行参数
 '''
 import urllib.parse   #它是专门用来解析、拆解、拼接和编码 URL（网址）的工具箱。
-import json
 import base64
 from mcp.server.fastmcp import FastMCP
 import requests       #专门负责帮你去访问网页、下载数据，或者调用远程的 API 接口
@@ -22,7 +21,9 @@ if project_root not in sys.path: sys.path.insert(0, project_root)
 
 from utils.config_handler import agent_conf
 from utils.path_tool import get_abs_path
-from db.database import get_connection
+from db.session import session_scope
+from repositories.product import ProductRepository
+from schemas import ProductRead
 from cache.redis_client import get_cache, set_cache
 #导包的真实原理：包名为子目录，去python的路径列表找根目录，然后进行拼接
 '''
@@ -43,13 +44,21 @@ Python 去 sys.path 列表里挨个翻：
   "...\\site-packages\\utils\\config_handler.py"    ✗ 没有
 '''
 
-# 强制固化标准流编码，彻底防止 Windows Stdio 传输中文时的管道闭合异常
-if sys.platform == "win32":
-    import io
-    # sys.stdout.buffer → 底层二进制输出口
-    # TextIOWrapper → 包一层 utf-8 编码器，写文本时自动编码为字节
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+# 强制固化标准流编码，彻底防止 Windows Stdio 传输中文时的管道闭合异常。
+#
+# 为什么不再在模块顶层直接替换 sys.stdout：
+#   替换（sys.stdout = io.TextIOWrapper(...)）会让调用方持有的引用变成孤儿。
+#   本文件被 import 时（pytest、脚本复用工具函数）同样会触发替换，
+#   结果是测试收尾阶段报 "ValueError: I/O operation on closed file"。
+#   改成「只在作为 MCP 服务进程启动时（__main__）原地 reconfigure」，
+#   不改变对象身份，也不影响 import 本模块的调用方。
+def _force_utf8_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            # 被 pytest / IDE 接管的标准流可能没有 reconfigure，跳过即可
+            pass
 
 # 初始化基础日志兜底
 import logging
@@ -199,19 +208,29 @@ def get_current_weather(city: str) -> str:
 # =====================================================================
 # 工具 4: 产品推荐
 # =====================================================================
-def _row_to_product(row):
-    """把数据库行转成和原来 JSON 结构一致的 dict"""
-    return {
-        "id": row["id"],
-        "brand": row["brand"],
-        "name": row["name"],
-        "type": row["type"],
-        "price": row["price"],
-        "specs": json.loads(row["specs"]) if row["specs"] else {},
-        "features": json.loads(row["features"]) if row["features"] else [],
-        "suitable_for": json.loads(row["suitable_for"]) if row["suitable_for"] else [],
-        "rating": row["rating"],
-    }
+def _as_payload(product) -> dict:
+    """ORM 对象 → 可直接格式化的 dict。
+
+    序列化规则只由 schemas.ProductRead 定义：库里 specs/features 存的是 JSON 字符串，
+    解析、容错、字段筛选都在 schema 里做。MCP 和 HTTP 两条出口共用同一份规则，
+    以后加字段只改一个地方。
+    """
+    return ProductRead.model_validate(product).model_dump()
+
+
+def _load_products() -> list[dict]:
+    """读取全部产品（dict 形式）。
+
+    数据访问交给 ProductRepository，这里只负责「读失败不要炸 agent」：
+    两个工具都靠 `if not products: return "产品数据库暂未就绪"` 兜底，
+    所以读库异常时返回空列表，而不是把异常抛到 MCP 调用方。
+    """
+    try:
+        with session_scope() as session:
+            return [_as_payload(p) for p in ProductRepository(session).list_all()]
+    except Exception as e:
+        logger.warning(f"[Product] 读取产品数据失败: {e}")
+        return []
 
 @mcp.tool(description="根据用户的户型、预算、需求推荐合适的扫地机器人/扫拖一体机型号，返回推荐结果。")
 def product_recommend(
@@ -229,14 +248,9 @@ def product_recommend(
     :param has_pet: 是否有宠物，可选
     :param prefer_type: 偏好类型，如 "扫地机器人"、"扫拖一体机器人"，可选
     """
-    conn = get_connection()
-    rows = conn.execute("SELECT * FROM products").fetchall()
-    conn.close()
-
-    if not rows:
+    products = _load_products()
+    if not products:
         return "产品数据库暂未就绪"
-
-    products = [_row_to_product(r) for r in rows]
 
     scored = []
     for p in products:
@@ -294,18 +308,20 @@ def price_query(product_name: str) -> str:
     查询产品参考价格
     :param product_name: 产品名称，如 "智扫 X1 Pro"、"X2 Max"
     """
-    conn = get_connection()
-    rows = conn.execute("SELECT * FROM products").fetchall()
-    conn.close()
-
-    if not rows:
+    # 模糊匹配下推到 SQL：只有 6 条数据时无所谓，数据涨到 10 万条时
+    # 「只回传命中的几行」和「把整张表搬进内存再筛」是两回事。
+    try:
+        with session_scope() as session:
+            repo = ProductRepository(session)
+            matches = [_as_payload(p) for p in repo.search_by_name(product_name)]
+            if not matches:
+                all_names = "\n".join(f"  - {p.name}（¥{p.price}）" for p in repo.list_all())
+                if not all_names:
+                    return "产品数据库暂未就绪"
+                return f"未找到产品「{product_name}」，可选产品：\n{all_names}"
+    except Exception as e:
+        logger.warning(f"[Product] 价格查询失败: {e}")
         return "产品数据库暂未就绪"
-
-    products = [_row_to_product(r) for r in rows]
-    matches = [p for p in products if product_name.lower() in p["name"].lower() or product_name.lower() in p["id"].lower()]
-    if not matches:
-        all_names = "\n".join(f"  - {p['name']}（¥{p['price']}）" for p in products)
-        return f"未找到产品「{product_name}」，可选产品：\n{all_names}"
 
     lines = []
     for p in matches:
@@ -432,5 +448,7 @@ def export_report(
 
 
 if __name__ == "__main__":
+    # Stdio 传输前先固定编码，避免 Windows 下中文写坏管道
+    _force_utf8_stdio()
     # 唤起服务端 Stdio 监听
     mcp.run()

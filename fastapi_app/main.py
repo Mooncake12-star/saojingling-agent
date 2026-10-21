@@ -1,147 +1,69 @@
-import os
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator
+"""应用装配。
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
-#RedirectResponse：FastAPI 提供的一个响应类，返回 HTTP 重定向（状态码 307/302），
-# 告诉浏览器"你要找的东西在另一个地址，自动跳过去吧"。
-#StreamingResponse — FastAPI 提供的特殊响应类，不一次性返回完整数据，而是保持 TCP 连接打开，持续发送字节流
-from fastapi.responses import StreamingResponse, FileResponse, RedirectResponse
+本文件只做四件事，业务代码一行都不写：
+    1. lifespan：启动/关闭时的资源管理
+    2. 中间件：CORS
+    3. 路由：include_router（具体接口在 api/ 下）
+    4. 应用元信息
+
+改动前这个文件 147 行，把 6 个接口、SSE 拼装、图片 prompt 拼接、文件落盘全混在一起；
+现在剩 50 行左右，接口逻辑按职责分到了 api/ 和 services/。
+"""
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from utils.path_tool import ensure_project_root_in_syspath, get_project_root
+from utils.path_tool import ensure_project_root_in_syspath
+
+# 必须在导入本项目其他模块之前执行：保证从任意工作目录启动都能 import 到根目录下的包
 ensure_project_root_in_syspath()
 
-from fastapi_app.schemas import ChatRequest, ChatResponse, StatusResponse
-from fastapi_app.deps import manager
-from utils.logger_handler import logger
-#uvicorn fastapi_app.main:app --host 0.0.0.0 --port 8000
-#http://10.63.209.44:8000/docs 本地ip端口号
+from fastapi_app.api import api_router  # noqa: E402
+from fastapi_app.deps import manager  # noqa: E402
+from utils.logger_handler import logger  # noqa: E402
+
+# 启动命令：uvicorn fastapi_app.main:app --host 0.0.0.0 --port 8000
+# 交互式文档：http://127.0.0.1:8000/docs
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await manager.startup()
-    yield
-    await manager.shutdown()
+    try:
+        yield
+    finally:
+        # 用 finally：启动后如果异常退出，MCP 子进程也必须被回收，
+        # 否则下次启动会留下僵尸子进程占着管道
+        await manager.shutdown()
 
-#FastAPI 启动时先进入 lifespan，执行 yield 前的代码
+
 app = FastAPI(
     title="扫净灵 AI Agent",
     description="基于 ReAct Agent + RAG + MCP 的智能助手后端服务",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
-#实现前后端分离后此部分代码有用
+
+# 前后端分离后这部分有用；生产环境要把 allow_origins 收窄到具体域名
 app.add_middleware(
-    CORSMiddleware,           # 安装跨域中间件（处理浏览器跨域拦截）
-    allow_origins=["*"],      # 允许哪些域名访问，["*"]=全部放行（生产应写具体域名）
-    allow_credentials=True,   # 是否允许前端带 Cookie/Token 等凭证
-    allow_methods=["*"],      # 允许哪些 HTTP 方法，["*"]=全部（GET/POST/PUT/DELETE…）
-    allow_headers=["*"],      # 允许哪些自定义请求头，["*"]=全部
+    CORSMiddleware,
+    allow_origins=["*"],       # 允许哪些域名访问，["*"]=全部放行
+    allow_credentials=True,    # 是否允许前端带 Cookie/Token 等凭证
+    allow_methods=["*"],       # 允许的 HTTP 方法
+    allow_headers=["*"],       # 允许的自定义请求头
 )
 
-
-@app.get("/")
-async def root():
-    return RedirectResponse(url="/docs")
+app.include_router(api_router)
 
 
-@app.get("/health", response_model=StatusResponse)
-async def health_check():
-    return StatusResponse(
-        status="ok" if manager.is_ready else "degraded",
-        mcp_connected=manager._mcp_started,
-        rag_ready=manager._rag_ready,
-    )
+@app.get("/healthz", include_in_schema=False)
+async def liveness() -> dict[str, str]:
+    """最轻量的存活探针：不查数据库、不碰 MCP，只证明进程还在。
 
-#async def → 这是一个协程函数，调用后返回一个协程对象，交由事件循环调度
-#_stream_answer → 下划线开头表示"内部私有函数"，不对外暴露
-#生成器函数（含 yield）：每次执行到 yield 就暂停，把值丢给调用方，自己原地等待下一次被唤醒。
-#sse格式：data: 消息内容\n\n
-async def _stream_answer(query: str, image_path: str | None = None,
-                         session_id: str | None = None) -> AsyncGenerator[bytes, None]:
-    query_text = query
-    if image_path and os.path.exists(image_path):
-        query_text = f"{query}\n\n[用户已上传图片，文件路径：{image_path}，如需分析图片请使用 image_analyze 工具]"
-    agent = manager.get_agent(session_id)
-    async for chunk in agent.execute_stream(query_text, mcp_manager=manager.mcp_mgr):
-        yield f"data: {chunk}\n\n".encode("utf-8")
-    yield "data: [DONE]\n\n".encode("utf-8")
-
-
-@app.post("/chat/stream")
-async def chat_stream(body: ChatRequest):
-    if not manager.is_ready:
-        raise HTTPException(status_code=503, detail="Agent 服务未就绪")
-    return StreamingResponse(
-        _stream_answer(body.query, body.image_path, body.session_id),
-        #— 设置 HTTP 头 Content-Type: text/event-stream，告诉浏览器这是 SSE 流，浏览器 EventSource 解析器才会启动
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",# 禁止浏览器和代理缓存，流式数据每次都得拿最新的
-            "Connection": "keep-alive",# 保持 TCP 长连接不断开，否则发一个字断一次
-            "X-Accel-Buffering": "no",# 禁用 Nginx 缓冲，否则 Nginx 会攒够一整块才转发，失去流式效果
-        },
-    )
-
-
-@app.post("/chat", response_model=ChatResponse)
-async def chat_sync(body: ChatRequest):
-    if not manager.is_ready:
-        raise HTTPException(status_code=503, detail="Agent 服务未就绪")
-    query_text = body.query
-    if body.image_path and os.path.exists(body.image_path):
-        query_text = f"{body.query}\n\n[用户已上传图片，文件路径：{body.image_path}，如需分析图片请使用 image_analyze 工具]"
-    full = ""
-    async for chunk in manager.get_agent(body.session_id).execute_stream(
-        query_text, mcp_manager=manager.mcp_mgr
-    ):
-        full += chunk
-    return ChatResponse(answer=full)
-
-
-@app.post("/history/clear")
-async def clear_history(session_id: str = "default"):
-    manager.get_agent(session_id).clear_history()
-    return {"message": "对话历史已清空"}
-
-
-@app.post("/upload")
-async def upload_image(file: UploadFile = File(...)):
-    upload_dir = os.path.join(get_project_root(), "uploads")
-    os.makedirs(upload_dir, exist_ok=True)
-
-    file_path = os.path.join(upload_dir, file.filename)
-    content = await file.read()
-    '''
-    合起来 "wb" 就是二进制写入模式：
-    - 文件存在 → 清空重写
-    - 文件不存在 → 创建再写
-    - 写的是字节（bytes），不是文本字符串（str）
-    '''
-    with open(file_path, "wb") as f:
-        f.write(content)
-
-    abs_path = os.path.abspath(file_path)
-    logger.info(f"[FastAPI] 图片已上传: {abs_path}")
-    return {"filename": file.filename, "path": abs_path}
-
-
-@app.get("/report/{filename}")
-async def download_report(filename: str):
-    reports_dir = os.path.join(get_project_root(), "logs", "reports")
-    file_path = os.path.join(reports_dir, filename)
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="报告文件不存在")
-    #在 Starlette（FastAPI 底层）里，*FileResponse 只要传了 filename 参数，
-    # 就默认加 Content-Disposition: attachment*，
-    # media_type注解
-    '''
-    HTTP 的 Content-Type 响应头，告诉浏览器返回的是什么类型的数据：
-    - application/pdf → 这是 PDF 文件
-    - image/jpeg → 这是 JPEG 图片
-    - text/event-stream → 这是 SSE 流
-      浏览器根据 media_type 决定怎么处理：是下载、展示、还是解析。
-    '''
-    return FileResponse(file_path, media_type="application/pdf", filename=filename)
+    和 /health 的区别：这个用来判断「要不要重启进程」，
+    /health 用来判断「能不能接流量」。
+    """
+    return {"status": "alive"}

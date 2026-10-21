@@ -81,23 +81,23 @@ class TestFileHandler:
 
 class TestSchemas:
     def test_chat_request(self):
-        from fastapi_app.schemas import ChatRequest
+        from schemas import ChatRequest
         req = ChatRequest(query="你好")
         assert req.query == "你好"
         assert req.image_path is None
 
     def test_chat_request_with_image(self):
-        from fastapi_app.schemas import ChatRequest
+        from schemas import ChatRequest
         req = ChatRequest(query="分析图片", image_path="/tmp/test.jpg")
         assert req.image_path == "/tmp/test.jpg"
 
     def test_chat_response(self):
-        from fastapi_app.schemas import ChatResponse
+        from schemas import ChatResponse
         resp = ChatResponse(answer="这是回答")
         assert resp.answer == "这是回答"
 
     def test_status_response(self):
-        from fastapi_app.schemas import StatusResponse
+        from schemas import StatusResponse
         resp = StatusResponse(status="ok", mcp_connected=True, rag_ready=False)
         assert resp.status == "ok"
         assert resp.mcp_connected is True

@@ -10,7 +10,9 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from agent.react_agent import ReactAgent
-from db.database import get_connection
+from db.session import session_scope
+from models.user import LEGACY_USER_ID
+from repositories.conversation import ConversationRepository
 
 
 class FakeResp:
@@ -32,11 +34,10 @@ SID = "probe-memory-session"
 
 
 def reset(sid):
-    conn = get_connection()
-    conn.execute("DELETE FROM conversations WHERE session_id = ?", (sid,))
-    conn.execute("DELETE FROM conversation_summary WHERE session_id = ?", (sid,))
-    conn.commit()
-    conn.close()
+    # 改走 repository：db/database.py 已删除，裸连接不再存在
+    # P2 起会话属于某个用户，探测器沿用 legacy 账号（id=1）
+    with session_scope() as session:
+        ConversationRepository(session).clear(LEGACY_USER_ID, sid)
 
 
 async def main():

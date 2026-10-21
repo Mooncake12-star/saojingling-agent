@@ -1,0 +1,13 @@
+# 鉴权配置
+# 注意：jwt.secret 是开发默认值，上线必须用环境变量 ZST_JWT_SECRET 覆盖（见 services/security.py）
+jwt:
+  algorithm: HS256
+  # HS256 要求密钥不短于 32 字节，短了 PyJWT 会告警（InsecureKeyLengthWarning）
+  secret: dev-only-change-me-please-use-env-in-production
+  issuer: zst-agent
+  # access 短、refresh 长：access 泄露的窗口只有 30 分钟
+  access_token_minutes: 30
+  refresh_token_days: 7
+
+password:
+  min_length: 8

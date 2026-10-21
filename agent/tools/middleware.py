@@ -21,6 +21,8 @@ LLM 决定调 rag_summarize(query="大户型")
 中间件链：
   monitor_tool(request, handler=路由函数)
     ├─ 打日志："执行工具：rag_summarize"
+     handler 是调用工具”可理解成：handler 这一层只负责把参数原样交给 execute，execute 
+     再把参数交给 _execute_tool_async，真正的 tool.ainvoke 发生在最里面。
     ├─ await handler(request)
     │    └─ 路由函数：
     │         ├─ tool_dict["rag_summarize"]  → 找到 Tool 对象

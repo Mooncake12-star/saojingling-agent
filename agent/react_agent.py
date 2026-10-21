@@ -8,7 +8,9 @@ from typing import AsyncGenerator, List, Dict, Any, Optional
 from model.factory import get_chat_model
 from utils.prompt_loader import load_main_prompts
 from agent.tools.middleware import monitor_tool, log_before_model
-from db.database import get_connection
+from db.session import session_scope
+from repositories.conversation import ConversationRepository
+from models.user import LEGACY_USER_ID
 from utils.logger_handler import logger
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
@@ -109,7 +111,7 @@ class ReactMCPContextManager:
         # 协议握手初始化
         # 必须设超时：子进程若在 import 阶段做耗时初始化、或直接崩溃不响应，
         # initialize() 会无限等待，日志上既不报错也不成功（只能看到"卡住"）。
-        MCP_HANDSHAKE_TIMEOUT = 180  # 秒
+        MCP_HANDSHAKE_TIMEOUT = 40  # 秒
         try:
             await asyncio.wait_for(self.session.initialize(), timeout=MCP_HANDSHAKE_TIMEOUT)
         except asyncio.TimeoutError:
@@ -121,9 +123,9 @@ class ReactMCPContextManager:
         # 动态同步远程工具集，填充完毕self.llm_tools_schema
         #将MCP的是 ListToolsResult（FastMCP 内部对象），转换成大模型可以看懂的fucntion calling
         try:
-            await asyncio.wait_for(self._sync_mcp_tools(), timeout=60)
+            await asyncio.wait_for(self._sync_mcp_tools(), timeout=30)
         except asyncio.TimeoutError:
-            raise RuntimeError("MCP 工具列表拉取超时（>60s）：服务端未响应 tools/list")
+            raise RuntimeError("MCP 工具列表拉取超时（>30s）：服务端未响应 tools/list")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -249,10 +251,17 @@ class ReactAgent:
     # 折叠批大小：攒够 4 条（2 轮）才压一次摘要，避免每轮都多花一次 LLM 调用
     FOLD_BATCH = 4
 
-    def __init__(self, session_id: str = "default"):
+    def __init__(self, session_id: str = "default", user_id: int = LEGACY_USER_ID):
+        """user_id 决定这批记忆归谁。
+
+        默认值是历史数据归属账号（id=1）：Streamlit 单机版不走 HTTP、没有登录，
+        它写进去的对话仍落在 legacy 账号下，行为和 P2 之前一致。
+        FastAPI 侧一律显式传当前登录用户的 id。
+        """
         self.model = get_chat_model()
         self.system_prompt = load_main_prompts()
         self.session_id = session_id
+        self.user_id = user_id
         self.conversation_history: list = []
         self.summary: str = ""
         self._rows: list = []      # 未折叠的消息，元素为 (id, role, content)
@@ -262,22 +271,15 @@ class ReactAgent:
     # 记忆：短期=窗口原文，长期=滚动摘要（持久化）
     # ──────────────────────────────────────────
     def _load_history(self):
-        conn = get_connection()
-        row = conn.execute(
-            "SELECT summary, folded_until_id FROM conversation_summary WHERE session_id = ?",
-            (self.session_id,)
-        ).fetchone()
-        self.summary = (row["summary"] or "") if row else ""
-        folded_until_id = (row["folded_until_id"] or 0) if row else 0
+        # 读库统一走 repository；session_scope 保证异常时也会回滚并关闭连接
+        # （原实现是 conn.close() 直接跟在 execute 后面，异常时永远不会执行）
+        with session_scope() as session:
+            summary, _folded_until_id, rows = ConversationRepository(session).load_window(
+                self.user_id, self.session_id
+            )
 
-        # 只读「还没折进摘要」的那部分，更早的内容已经在 summary 里了
-        rows = conn.execute(
-            "SELECT id, role, content FROM conversations WHERE session_id = ? AND id > ? ORDER BY id",
-            (self.session_id, folded_until_id)
-        ).fetchall()
-        conn.close()
-
-        self._rows = [(r["id"], r["role"], r["content"]) for r in rows]
+        self.summary = summary
+        self._rows = rows
         self._rebuild_window()
 
     def _rebuild_window(self):
@@ -335,16 +337,10 @@ class ReactAgent:
             return
 
         folded_until_id = to_fold[-1][0]
-        conn = get_connection()
-        conn.execute(
-            "INSERT INTO conversation_summary (session_id, summary, folded_until_id, updated_at) "
-            "VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
-            "ON CONFLICT(session_id) DO UPDATE SET "
-            "summary = excluded.summary, folded_until_id = excluded.folded_until_id, updated_at = CURRENT_TIMESTAMP",
-            (self.session_id, new_summary, folded_until_id)
-        )
-        conn.commit()
-        conn.close()
+        with session_scope() as session:
+            ConversationRepository(session).upsert_summary(
+                self.user_id, self.session_id, new_summary, folded_until_id
+            )
 
         self.summary = new_summary
         self._rows = self._rows[overflow:]
@@ -352,15 +348,12 @@ class ReactAgent:
         logger.info(f"[Memory] 已折叠 {len(to_fold)} 条旧消息进摘要（session={self.session_id}）")
 
     def _save_message(self, role: str, content: str):
-        conn = get_connection()
-        cur = conn.execute(
-            "INSERT INTO conversations (session_id, role, content) VALUES (?, ?, ?)",
-            (self.session_id, role, content)
-        )
-        conn.commit()
-        conn.close()
+        with session_scope() as session:
+            msg_id = ConversationRepository(session).append(
+                self.user_id, self.session_id, role, content
+            )
         # 同步进内存，避免下一轮再查库
-        self._rows.append((cur.lastrowid, role, content))
+        self._rows.append((msg_id, role, content))
 
     async def execute_stream(self, query: str, mcp_manager: ReactMCPContextManager) -> AsyncGenerator[str, None]:
 
@@ -450,11 +443,8 @@ class ReactAgent:
         self.conversation_history.clear()
         self.summary = ""
         self._rows = []
-        conn = get_connection()
-        conn.execute("DELETE FROM conversations WHERE session_id = ?", (self.session_id,))
-        conn.execute("DELETE FROM conversation_summary WHERE session_id = ?", (self.session_id,))
-        conn.commit()
-        conn.close()
+        with session_scope() as session:
+            ConversationRepository(session).clear(self.user_id, self.session_id)
 
 if __name__ == '__main__':
     # 本地联调测试逻辑

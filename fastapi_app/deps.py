@@ -8,7 +8,7 @@ from agent.react_agent import ReactAgent, ReactMCPContextManager
 from rag.local_tool import local_rag_summarize
 from rag.vector_store import VectorStoreService
 from utils.logger_handler import logger
-from db.database import get_connection
+from db.health import ensure_schema_ready
 
 
 class AgentManager:
@@ -18,32 +18,39 @@ class AgentManager:
     MAX_SESSIONS = 200
 
     def __init__(self):
-        self.agent: Optional[ReactAgent] = None
         self.mcp_mgr: Optional[ReactMCPContextManager] = None
         self._mcp_started = False
         self._rag_ready = False
-        self._agents: dict[str, ReactAgent] = {}
+        self._startup_done = False
+        # key 必须是 (user_id, session_id)，不能只用 session_id。
+        # 只用 session_id 的话，两个用户都请求 "default" 会拿到同一个 ReactAgent 对象，
+        # A 的对话历史会直接出现在 B 的上下文里——SQL 一条没漏查，照样越权。
+        self._agents: dict[tuple[int, str], ReactAgent] = {}
 
-    def get_agent(self, session_id: Optional[str] = None) -> ReactAgent:
-        """按会话取 Agent：每个 session 一份独立历史，不再全站共用 "default"。"""
+    def get_agent(self, user_id: int, session_id: Optional[str] = None) -> ReactAgent:
+        """按「用户 + 会话」取 Agent：每个用户的每个会话一份独立历史。"""
         sid = (session_id or "").strip() or "default"
-        agent = self._agents.get(sid)
+        key = (user_id, sid)
+        agent = self._agents.get(key)
         if agent is None:
             if len(self._agents) >= self.MAX_SESSIONS:
                 oldest = next(iter(self._agents))
                 self._agents.pop(oldest, None)
-                logger.info(f"[FastAPI] 会话数超上限，淘汰最旧会话: {oldest}")
-            agent = ReactAgent(session_id=sid)
-            self._agents[sid] = agent
-            logger.info(f"[FastAPI] 新建会话: {sid}")
+                logger.info(f"[FastAPI] 会话数超上限，淘汰最旧会话: user={oldest[0]} session={oldest[1]}")
+            agent = ReactAgent(session_id=sid, user_id=user_id)
+            self._agents[key] = agent
+            logger.info(f"[FastAPI] 新建会话: user={user_id} session={sid}")
         return agent
 
     async def startup(self):
         logger.info("[FastAPI] 正在启动 Agent 服务...")
-        # 初始化 SQLite 数据库（自动建表 + 导入产品数据）
-        get_connection()
-        logger.info("[FastAPI] SQLite 数据库已初始化")
-        self.agent = self.get_agent("default")
+        # 表结构由 Alembic 管理：这里只做检查，缺表直接带修复命令报错，
+        # 不再像以前那样用 get_connection() 顺手建表（那会掩盖「忘跑迁移」）
+        version = ensure_schema_ready()
+        logger.info(f"[FastAPI] 数据库迁移版本: {version}")
+        # 不再预建「默认会话」：P2 之后每个 Agent 都属于某个用户，
+        # 启动时没有用户，也就没有该建的会话。就绪状态由标志位表示。
+        self._startup_done = True
         # 把 data/ 下的知识库文件加载到 ChromaDB（快速，不影响启动）
         self._init_knowledge()
 
@@ -97,7 +104,7 @@ class AgentManager:
 
     @property
     def is_ready(self) -> bool:
-        return self.agent is not None and self._mcp_started
+        return self._startup_done and self._mcp_started
 
 
 manager = AgentManager()

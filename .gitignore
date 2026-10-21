@@ -10,6 +10,9 @@ __pycache__/
 chroma_db/
 rag/chroma_db/
 *.db
+# SQLite 开了 WAL 之后会生成两个伴生文件，数据还没落进主库，误删会丢最近的写入
+*.db-wal
+*.db-shm
 
 # Logs
 logs/
