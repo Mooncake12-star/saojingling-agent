@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import hmac
+import os
 from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
@@ -13,6 +15,10 @@ from sqlalchemy.orm import Session
 from fastapi_app.services import security
 from models.user import User
 from repositories.user import UserRepository
+from utils.logger_handler import logger
+
+# 环境变量名单独抽出来：部署文档、compose、测试都引它，避免各处手打字符串对不上
+INVITE_ENV = "ZST_INVITE_CODE"
 
 
 class AuthError(Exception):
@@ -33,6 +39,10 @@ class InactiveUser(AuthError):
 
 class WeakPassword(AuthError):
     pass
+
+
+class InvalidInviteCode(AuthError):
+    """邀请码不对，或服务端要求邀请码但请求没带。"""
 
 
 @dataclass(frozen=True)
@@ -56,7 +66,41 @@ def _issue(user: User) -> TokenPair:
     )
 
 
-def register(session: Session, email: str, password: str) -> User:
+def required_invite_code() -> str | None:
+    """服务端要求的邀请码；未配置时返回 None。
+
+    为什么用环境变量而不是配置文件：
+        邀请码是「部署时才决定」的东西，写进 yml 就会跟着代码进仓库，
+        等于把进门的钥匙挂在门上。
+    """
+    code = os.getenv(INVITE_ENV, "").strip()
+    return code or None
+
+
+def check_invite_code(provided: str | None) -> None:
+    """校验邀请码。服务端没配 ZST_INVITE_CODE 时直接放行（本地开发不受影响）。
+
+    用 hmac.compare_digest 而不是 ==：
+        字符串比较在第一个不同字符就返回，耗时随「有几个字符是对的」变化。
+        这个差异能被人用大量请求统计出来，逐个字符猜出邀请码。
+        compare_digest 耗时只与长度有关。
+    转 bytes 再比：compare_digest 对 str 只接受 ASCII，
+        邀请码里出现中文会直接抛 TypeError，那就变成 500 了。
+    """
+    expected = required_invite_code()
+    if expected is None:
+        return
+    if not provided or not hmac.compare_digest(
+        provided.strip().encode("utf-8"), expected.encode("utf-8")
+    ):
+        raise InvalidInviteCode("邀请码不正确")
+
+
+def register(session: Session, email: str, password: str, invite_code: str | None = None) -> User:
+    # 邀请码放在最前面校验：不能让人用错误的邀请码去试探「这个邮箱存不存在」，
+    # 否则加了邀请码等于没加，注册接口照样是个邮箱枚举器。
+    check_invite_code(invite_code)
+
     problem = security.validate_password_strength(password)
     if problem:
         raise WeakPassword(problem)

@@ -15,6 +15,7 @@ from collections.abc import AsyncGenerator
 
 from agent.react_agent import ReactAgent
 from fastapi_app.deps import AgentManager, manager
+from rag.scope import use_scope
 
 # 拼给 Agent 的图片提示。抽成常量，改文案时不用在两处同步
 IMAGE_HINT = "\n\n[用户已上传图片，文件路径：{path}，如需分析图片请使用 image_analyze 工具]"
@@ -37,14 +38,23 @@ async def stream_chunks(
     image_path: str | None = None,
     session_id: str | None = None,
     agent_manager: AgentManager | None = None,
+    knowledge_base_id: int | None = None,
 ) -> AsyncGenerator[str, None]:
-    """产出模型返回的文本片段（不带 SSE 协议包装）。"""
+    """产出模型返回的文本片段（不带 SSE 协议包装）。
+
+    检索范围在这里设定，而不是在工具里：
+        Agent 调 rag_summarize 时并不知道、也不该知道当前用户的知识库 id。
+        整个生成过程都包在 use_scope 里，工具实现（跑在线程池里）通过
+        ContextVar 读到同一个范围——包括流式过程中途调用的多次工具。
+        生成器结束时 with 块退出，范围自动还原，不会泄漏到下一个请求。
+    """
     mgr = agent_manager or manager
     agent: ReactAgent = mgr.get_agent(user_id, session_id)
-    async for chunk in agent.execute_stream(
-        build_query_text(query, image_path), mcp_manager=mgr.mcp_mgr
-    ):
-        yield chunk
+    with use_scope(user_id, knowledge_base_id):
+        async for chunk in agent.execute_stream(
+            build_query_text(query, image_path), mcp_manager=mgr.mcp_mgr
+        ):
+            yield chunk
 
 
 async def stream_sse(
@@ -53,13 +63,16 @@ async def stream_sse(
     image_path: str | None = None,
     session_id: str | None = None,
     agent_manager: AgentManager | None = None,
+    knowledge_base_id: int | None = None,
 ) -> AsyncGenerator[bytes, None]:
     """产出完整的 SSE 帧：`data: <chunk>\\n\\n`，结尾补 `[DONE]`。
 
     为什么要显式发 [DONE]：EventSource 只认服务端关闭连接，
     前端如果不解析结束标记，就只能靠 onerror 判断结束，会把正常结束当成错误。
     """
-    async for chunk in stream_chunks(user_id, query, image_path, session_id, agent_manager):
+    async for chunk in stream_chunks(
+        user_id, query, image_path, session_id, agent_manager, knowledge_base_id
+    ):
         yield f"data: {chunk}\n\n".encode("utf-8")
     yield b"data: [DONE]\n\n"
 
@@ -70,9 +83,12 @@ async def collect_answer(
     image_path: str | None = None,
     session_id: str | None = None,
     agent_manager: AgentManager | None = None,
+    knowledge_base_id: int | None = None,
 ) -> str:
     """把流拼成完整回答，给非流式接口用。"""
     parts: list[str] = []
-    async for chunk in stream_chunks(user_id, query, image_path, session_id, agent_manager):
+    async for chunk in stream_chunks(
+        user_id, query, image_path, session_id, agent_manager, knowledge_base_id
+    ):
         parts.append(chunk)
     return "".join(parts)

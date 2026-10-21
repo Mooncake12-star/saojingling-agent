@@ -1,0 +1,96 @@
+# 高可用叠加层：PostgreSQL + 多副本 app
+#
+# 用法：
+#   1) 在 .env 里加：
+#        ZST_PG_PASSWORD=<一串随机密码>
+#        ZST_APP_REPLICAS=2
+#   2) 启动：
+#        docker compose -f docker-compose.yml -f docker-compose.ha.yml up -d --build
+#   3) 验证副本数：
+#        docker compose -f docker-compose.yml -f docker-compose.ha.yml ps
+#        curl -s localhost:8080/readyz | jq .      # 多刷几次，能观察到不同副本
+#
+# ⚠️ 内存前提（必须读）
+#   每个 app 副本会各自加载一份 BGE 重排模型：
+#       基础进程 ~0.7GB + 重排模型 ~1.1GB ≈ 1.8GB
+#   2 副本 ≈ 3.6GB，加上 PostgreSQL(0.3G) + nginx/redis(0.1G) + 系统(0.5G)
+#   ≈ 4.5GB。
+#   → 2C4G 机器**开不起来**，会 OOM。最少 4C8G，且把 ZST_APP_REPLICAS 设成 2。
+#   → 想在一台 4C8G 上跑更多副本，就必须把重排模型外置成独立推理服务
+#     （把 rag/reranker.py 的实现换成 HTTP 调用），本项目未做这一步。
+#
+# 为什么多副本必须换 PostgreSQL
+#   SQLite 是单文件 + 单写锁：
+#     - 两个容器的同一个文件靠 bind mount 共享，跨容器文件锁不可靠，
+#       会随机出现 "database is locked" 甚至损坏；
+#     - 写并发上限就是一把文件锁，多副本不会提高写入吞吐。
+#   PostgreSQL 天然是多连接并发，这是能开副本的前提，不是「顺手升级」。
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: saojingling-postgres
+    environment:
+      POSTGRES_DB: ${ZST_PG_DB:-saojingling}
+      POSTGRES_USER: ${ZST_PG_USER:-saojingling}
+      POSTGRES_PASSWORD: ${ZST_PG_PASSWORD:?请在 .env 里设置 ZST_PG_PASSWORD}
+      # 中文排序/大小写按 C 处理，避免不同宿主机 locale 造成索引不一致
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      # app 等它 healthy 才启动，避免「迁移时连不上库」→ 容器退出 → 重启循环
+      test: ["CMD-SHELL", "pg_isready -U ${ZST_PG_USER:-saojingling} -d ${ZST_PG_DB:-saojingling}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    # 只在内网暴露，不映射到宿主机
+    expose:
+      - "5432"
+    # 连接数要撑得住「副本数 × 连接池」。db/session.py 里 PostgreSQL 没做
+    # pool_size 限制（走 SQLAlchemy 默认 5+10），2 副本最多 30 条连接，
+    # 默认 max_connections=100 够用；开更多副本时按 副本数×15 估算
+    command:
+      - postgres
+      - -c
+      - max_connections=120
+      - -c
+      - shared_buffers=256MB
+
+  app:
+    # 覆盖成 2 副本（也可用 ZST_APP_REPLICAS 调）
+    deploy:
+      replicas: ${ZST_APP_REPLICAS:-2}
+      resources:
+        limits:
+          # 超过这个值容器直接被 OOM kill，然后 restart：
+          # 让「一个副本挂掉被重建」代替「整台机器换页卡死」。
+          # 1.8GB 是实测稳态，给到 2.5GB 留出峰值余量
+          memory: 2560m
+    environment:
+      # psycopg 是 requirements 里的 PostgreSQL 驱动。
+      # 密码若含 @ : / 等字符必须 URL 编码，否则会被当成 host 分隔符
+      ZST_DB_URL: postgresql+psycopg://${ZST_PG_USER:-saojingling}:${ZST_PG_PASSWORD}@postgres:5432/${ZST_PG_DB:-saojingling}
+      # 多副本下这几个必须固定，不能靠进程内默认值：
+      #   无状态 Agent —— 否则同一会话落到不同副本会看到不同历史
+      ZST_AGENT_STATELESS: "1"
+      # 单副本的对话上限是 16；总容量 = 16 × 副本数。
+      # 不随副本数调大，因为瓶颈是 DashScope 的并发配额，不是本机
+      ZST_CHAT_CONCURRENCY: ${ZST_CHAT_CONCURRENCY:-16}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  nginx:
+    # 依赖保持不变即可：upstream 里写的是服务名 app，
+    # 副本 IP 由 Docker DNS 返回，nginx 按 valid=10s 周期重查
+    depends_on:
+      - app
+
+volumes:
+  pg_data:

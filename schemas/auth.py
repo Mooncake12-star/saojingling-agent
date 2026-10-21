@@ -23,6 +23,12 @@ _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 class RegisterRequest(BaseModel):
     email: str = Field(max_length=255, description="登录邮箱，不区分大小写")
     password: str = Field(min_length=8, max_length=128, description="至少 8 位")
+    # 公网部署时用 ZST_INVITE_CODE 开启校验；没配这个环境变量时字段填不填都行。
+    # 设成可选而不是必填：本地开发、测试、离线演示都不需要邀请码，
+    # 强制必填会让「clone 下来就能跑」这件事多一道无关的门槛。
+    invite_code: str | None = Field(
+        default=None, max_length=128, description="邀请码（仅当服务端开启校验时需要）"
+    )
 
     @field_validator("email")
     @classmethod

@@ -28,6 +28,11 @@ def _safe_name(filename: str | None) -> str:
     return name
 
 
+# 公开别名：知识库模块要复用同一套「防路径穿越」规则，
+# 但跨模块 import 一个下划线开头的函数等于承认它是私有的，不如给个正名
+safe_filename = _safe_name
+
+
 def upload_dir() -> Path:
     path = Path(get_project_root()) / UPLOAD_DIRNAME
     path.mkdir(parents=True, exist_ok=True)

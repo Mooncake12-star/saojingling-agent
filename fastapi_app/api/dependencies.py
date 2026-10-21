@@ -23,6 +23,7 @@ from fastapi_app.deps import AgentManager, manager
 from fastapi_app.services import security
 from models.user import User
 from repositories.user import UserRepository
+from utils.log_context import set_user_id
 
 # tokenUrl 指向登录接口：/docs 右上角的 Authorize 按钮就靠它
 # auto_error=False：缺 token 时不让 FastAPI 自己抛英文错误，统一走下面的中文 401
@@ -65,6 +66,11 @@ def get_current_user(
     if payload.token_version != user.token_version:
         # 改密码 / 主动登出后，旧 token 会走到这里
         raise _unauthorized("已在其他位置退出登录，请重新登录")
+
+    # 身份确定后绑定到日志上下文：之后这个请求里的每条日志都会带 uid，
+    # 不用在每个 logger.info 里手动传 user_id。不需要在这里还原——
+    # 中间件在请求结束时统一 reset
+    set_user_id(user.id)
     return user
 
 

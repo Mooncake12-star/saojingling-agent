@@ -16,7 +16,14 @@ from sqlalchemy import inspect, text
 from db.session import engine
 
 # 必须存在的表。漏一个就说明迁移没跑完。
-REQUIRED_TABLES = ("products", "conversations", "conversation_summary")
+REQUIRED_TABLES = (
+    "products",
+    "conversations",
+    "conversation_summary",
+    "users",
+    "knowledge_bases",
+    "documents",
+)
 
 
 def ensure_schema_ready() -> str:

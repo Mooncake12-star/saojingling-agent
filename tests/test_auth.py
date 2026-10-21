@@ -264,3 +264,70 @@ def test_verify_password_tolerates_broken_hash():
     """库里的哈希串损坏时返回 False，而不是让登录接口 500。"""
     assert not security.verify_password("x", "!disabled")
     assert not security.verify_password("x", "")
+
+
+# ---------- 邀请码（公网部署才开） ----------
+
+def test_register_without_invite_env_stays_open(client, monkeypatch):
+    """没配 ZST_INVITE_CODE 时不设防：本地开发、离线演示不该被邀请码挡住。"""
+    monkeypatch.delenv("ZST_INVITE_CODE", raising=False)
+    assert register(client).status_code == 201
+
+
+def test_register_requires_invite_code_when_enabled(client, monkeypatch):
+    monkeypatch.setenv("ZST_INVITE_CODE", "zst-2026")
+    # 完全不带字段
+    assert register(client).status_code == 403
+    # 带错的
+    resp = client.post(
+        "/auth/register",
+        json={"email": "a@test.local", "password": "password123", "invite_code": "guess"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "邀请码不正确"
+
+
+def test_register_succeeds_with_correct_invite_code(client, monkeypatch):
+    monkeypatch.setenv("ZST_INVITE_CODE", "zst-2026")
+    resp = client.post(
+        "/auth/register",
+        json={"email": "a@test.local", "password": "password123", "invite_code": "zst-2026"},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["email"] == "a@test.local"
+
+
+def test_invite_check_runs_before_email_lookup(client, monkeypatch):
+    """邀请码不对时，即使邮箱已注册也必须返回 403。
+
+    否则这个接口就成了邮箱枚举器：拿错误邀请码去试，
+    409 说明「注册过」、403 说明「没注册过」——邀请码等于白加。
+    """
+    monkeypatch.delenv("ZST_INVITE_CODE", raising=False)
+    assert register(client).status_code == 201   # 先正常注册一个
+
+    monkeypatch.setenv("ZST_INVITE_CODE", "zst-2026")
+    resp = client.post(
+        "/auth/register",
+        json={"email": "a@test.local", "password": "password123", "invite_code": "wrong"},
+    )
+    assert resp.status_code == 403
+    assert "已注册" not in resp.json()["detail"]
+
+
+def test_invite_code_with_non_ascii_does_not_crash(monkeypatch):
+    """中文邀请码不能因为 compare_digest 只吃 ASCII 而抛 TypeError 变成 500。"""
+    from fastapi_app.services.auth import InvalidInviteCode, check_invite_code
+
+    monkeypatch.setenv("ZST_INVITE_CODE", "扫净灵内测")
+    check_invite_code("扫净灵内测")          # 不抛
+    with pytest.raises(InvalidInviteCode):
+        check_invite_code("扫净灵公测")
+
+
+def test_invite_code_ignores_surrounding_spaces(monkeypatch):
+    """从聊天软件复制邀请码经常带空格或换行，不该因此被拒。"""
+    from fastapi_app.services.auth import check_invite_code
+
+    monkeypatch.setenv("ZST_INVITE_CODE", "  zst-2026  ")
+    check_invite_code("zst-2026\n")

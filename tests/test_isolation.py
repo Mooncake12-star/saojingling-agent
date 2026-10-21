@@ -132,13 +132,18 @@ def test_agent_cache_key_includes_user(monkeypatch):
 
     如果 key 只用 session_id，B 会直接复用 A 的 ReactAgent——
     它的 conversation_history 里装着 A 的对话。数据一行没漏查，照样泄露。
+
+    这里显式打开缓存模式（ZST_AGENT_STATELESS=0）来验证 key 的结构；
+    默认的无状态行为由下一个用例覆盖。
     """
+    monkeypatch.setenv("ZST_AGENT_STATELESS", "0")
     monkeypatch.setattr(
         deps_module,
         "ReactAgent",
         lambda session_id, user_id: SimpleNamespace(session_id=session_id, user_id=user_id),
     )
     mgr = deps_module.AgentManager()
+    assert mgr.stateless is False
 
     a_agent = mgr.get_agent(1, "default")
     b_agent = mgr.get_agent(2, "default")
@@ -148,6 +153,32 @@ def test_agent_cache_key_includes_user(monkeypatch):
     assert b_agent.user_id == 2
     # 同一个用户的同一个会话仍然复用
     assert mgr.get_agent(1, "default") is a_agent
+
+
+def test_agent_stateless_by_default(monkeypatch):
+    """默认每个请求新建 Agent：历史完全由数据库决定。
+
+    这是多 worker / 多副本的前提——进程内缓存一旦跨进程就变成「各持一份
+    过期副本」，同一个会话落到不同副本会看到不同历史。无状态下每个进程
+    都从库里读，天然一致（代价是每次多一条主键索引查询）。
+    """
+    monkeypatch.delenv("ZST_AGENT_STATELESS", raising=False)
+    monkeypatch.setattr(
+        deps_module,
+        "ReactAgent",
+        lambda session_id, user_id: SimpleNamespace(session_id=session_id, user_id=user_id),
+    )
+    mgr = deps_module.AgentManager()
+    assert mgr.stateless is True
+
+    first = mgr.get_agent(1, "default")
+    second = mgr.get_agent(1, "default")
+
+    # 不是同一个对象（没有进程内状态），但坐标相同（读的是同一份库内历史）
+    assert first is not second
+    assert (first.user_id, first.session_id) == (second.user_id, second.session_id)
+    # 进程内不残留任何 Agent 引用，多 worker 下不会各持一份
+    assert mgr._agents == {}
 
 
 # ---------- 接口层 ----------

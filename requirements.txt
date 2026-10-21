@@ -34,6 +34,9 @@ streamlit==1.55.0
 # ==================== 数据库 / 迁移 ====================
 sqlalchemy>=2.0
 alembic>=1.16
+# PostgreSQL 驱动。多副本部署必须换掉 SQLite（单文件写锁 + 无法跨容器共享），
+# 换库只改 ZST_DB_URL，代码不动。binary 版自带 libpq，不用在镜像里装编译工具链
+psycopg[binary]>=3.2
 
 # ==================== 鉴权 ====================
 # pwdlib 的 recommended() 就是 argon2；不用 passlib（已停止维护）

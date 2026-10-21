@@ -19,6 +19,12 @@ from schemas.chat import (
     StatusResponse,
     UploadResponse,
 )
+from schemas.knowledge import (
+    DeleteResponse,
+    DocumentRead,
+    KnowledgeBaseCreate,
+    KnowledgeBaseRead,
+)
 from schemas.product import ProductRead
 
 __all__ = [
@@ -33,4 +39,8 @@ __all__ = [
     "RefreshRequest",
     "UserRead",
     "LogoutResponse",
+    "KnowledgeBaseCreate",
+    "KnowledgeBaseRead",
+    "DocumentRead",
+    "DeleteResponse",
 ]

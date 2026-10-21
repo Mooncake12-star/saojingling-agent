@@ -60,81 +60,41 @@ def _cn_preprocess(text: str) -> List[str]:
 
 
 # ──────────────────────────────────────────────
-# 1. 专业 Reranker — 惰性加载，首次调用时才下载模型
+# 1. 专业 Reranker — 交给 rag/reranker.py 管生命周期
 # ──────────────────────────────────────────────
-RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
-
-_RERANKER_INSTANCE = None
-# None = 还没探测过；True/False = 探测结果。
-# 注意不要在这里 import sentence_transformers：它会把 torch + transformers
-# 一起拖进来（实测约 38 秒、占用 1.5GB+ 内存）。任何"只是想用向量检索"的
-# 进程（例如 MCP 子进程）不应该为它付这个代价。
-_HAS_BGE_RERANKER = None
-
-
-def _local_snapshot_dir(repo_id: str):
-    """在 HuggingFace 缓存里找已下载的模型快照目录，找不到返回 None。
-
-    为什么要这么绕：sentence-transformers 5.x 即使传 local_files_only=True，
-    仍会去校验仓库元数据（实测 hf-mirror 返回 502 时整个加载直接失败）。
-    直接把本地快照目录当"路径"传进去，hf 侧就不会发起任何网络请求——
-    断网、镜像站抖动都不影响。
-    """
-    hf_home = os.getenv("HF_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
-    snapshots = os.path.join(hf_home, "hub", "models--" + repo_id.replace("/", "--"), "snapshots")
-    if not os.path.isdir(snapshots):
-        return None
-    candidates = [
-        os.path.join(snapshots, name)
-        for name in os.listdir(snapshots)
-        if os.path.isfile(os.path.join(snapshots, name, "config.json"))
-    ]
-    if not candidates:
-        return None
-    return max(candidates, key=os.path.getmtime)
-
-
-def _get_bge_reranker():
-    global _RERANKER_INSTANCE
-    global _HAS_BGE_RERANKER
-    if _RERANKER_INSTANCE is not None:
-        return _RERANKER_INSTANCE
-    if _HAS_BGE_RERANKER is False:
-        return None
-
-    try:
-        #CrossEncoder加载模型的接口，先访问本地如果本地没有去huggingface下载
-        #访问的本地文件路径C:\Users\ADMIN\.cache\huggingface\hub
-        from sentence_transformers import CrossEncoder
-    except ImportError:
-        _HAS_BGE_RERANKER = False
-        logger.warning("[Reranker] sentence-transformers 未安装，降级到 LLM 重排序")
-        return None
-
-    _HAS_BGE_RERANKER = True
-    try:
-        # 先走本地快照（完全不联网），没有缓存再按仓库名联网下载
-        local_dir = _local_snapshot_dir(RERANKER_MODEL_NAME)
-        if local_dir:
-            _RERANKER_INSTANCE = CrossEncoder(local_dir)
-            logger.info(f"[Reranker] 已从本地缓存加载模型: {local_dir}")
-        else:
-            logger.info("[Reranker] 本地无缓存，开始在线下载")
-            _RERANKER_INSTANCE = CrossEncoder(RERANKER_MODEL_NAME)
-            logger.info(f"[Reranker] 已加载模型: {RERANKER_MODEL_NAME}")
-        return _RERANKER_INSTANCE
-    except Exception as e:
-        logger.warning(f"[Reranker] 模型加载失败，降级到 LLM 重排序: {e}")
-        _HAS_BGE_RERANKER = False
-        return None
+# 模型只加载一份、推理限并发、忙时降级，这些都在 reranker 模块里做完了。
+# 这里不再保留任何模型状态：本文件会被多个 scope 的实例共享，
+# 把状态放在模块变量里，等于让「缓存了几个 scope」决定「模型被加载几次」。
+from rag.reranker import (  # noqa: E402
+    STATE_DISABLED,
+    STATE_FAILED,
+    STATE_READY,
+    reranker,
+)
 
 
 class RagSummarizeService:
-    def __init__(self, keyword_top_k: int = 10, final_top_k: int = 6):
+    def __init__(
+        self,
+        keyword_top_k: int = 10,
+        final_top_k: int = 6,
+        where: dict | None = None,
+    ):
+        """where 限定「这次检索能看到哪些 chunk」（Chroma 过滤表达式）。
+
+        为什么范围要在构造时定死，而不是每次 invoke 时传：
+            混合检索里的 BM25 是在构造阶段用候选集合建索引的，
+            索引一旦建好就固定了。如果只在查询时过滤向量那一路，
+            BM25 那一路仍会从别人的文档里召回——两路各查各的，
+            混起来就是「一半守规矩、一半不守」。
+            所以范围必须同时作用于「建索引」和「向量检索」，而这两件事
+            都发生在构造阶段。不同范围用不同实例，由 rag/local_tool.py 缓存。
+        """
         self.vector_store_svc = VectorStoreService()
         self.model = get_chat_model()
         self.keyword_top_k = keyword_top_k
         self.final_top_k = final_top_k
+        self.where = where
         self.prompt_text = load_rag_prompts()
         self.prompt_template = PromptTemplate.from_template(self.prompt_text)
 
@@ -144,24 +104,16 @@ class RagSummarizeService:
 
     #给文档打分，然后从高到低按top_k拿文档
     def _init_ensemble_retriever(self):
-        """初始化集成检索器：向量检索 + BM25 关键词检索"""
-        vector_retriever = self.vector_store_svc.get_retriever()
-        raw_chroma = self.vector_store_svc.vector_store
+        """初始化集成检索器：向量检索 + BM25 关键词检索（限定在 self.where 范围内）"""
+        vector_retriever = self.vector_store_svc.get_retriever(self.where)
 
-        all_data = raw_chroma.get(include=["documents", "metadatas"])
-        #get("documents", [])如果 all_data 里面不存在 "documents" 这个 key，就返回空列表 []，而不是直接报 KeyError。
-        texts = all_data.get("documents", [])
-        metadatas = all_data.get("metadatas", [])
+        docs = self.vector_store_svc.get_documents(self.where)
 
-        if not texts:
-            logger.warning("[检索器] 向量库中无文档，回退到纯向量检索")
+        if not docs:
+            logger.warning(f"[检索器] 范围内无文档（where={self.where}），回退到纯向量检索")
             self.ensemble_retriever = vector_retriever
             return
 
-        docs = [
-            Document(page_content=t, metadata=m or {})
-            for t, m in zip(texts, metadatas or [{}] * len(texts))
-        ]
         #把docs里的所有 Document 建立成一个 BM25 关键词检索器。
         #必须显式传 preprocess_func：默认的 text.split() 切不开中文，会让 BM25 失效。
         bm25_retriever = BM25Retriever.from_documents(docs, preprocess_func=_cn_preprocess)
@@ -173,24 +125,30 @@ class RagSummarizeService:
             weights=[0.5, 0.5],
             k=10
         )
-        logger.info(f"[检索器] EnsembleRetriever 构建完成（向量+BM25），共 {len(docs)} 个文档参与构建集成检索器")
+        logger.info(
+            f"[检索器] EnsembleRetriever 构建完成（向量+BM25），共 {len(docs)} 个文档参与构建集成检索器"
+        )
 
     # ──────────────────────────────────────────────
     # 2. BGE Reranker — 比 LLM 打分更稳、更快
     # ─────────────────────────────────────────────—
     def _bge_rerank(self, query: str, docs: List[Document]):
+        """BGE 精排。返回 (文档, 分数) 或 None。
+
+        None 表示「这次没排成」——模型没就绪、推理并发已满、或推理报错。
+        调用方应当保留 RRF 融合顺序继续走，而不是回头去调 LLM 重排：
+        重排只是排序优化，为了它多花一次 3~5 秒的 LLM 调用不值得。
+        """
         if not docs:
             return docs, []
 
-        reranker_model = _get_bge_reranker()
-        if reranker_model is None:
-            return self._llm_rerank(query, docs), []
         pairs = [[query, d.page_content[:512]] for d in docs]
         #用bge重排给配对的问题+文档chunk打分，BGE到底拿什么“算”出这个相关性分数
         #它不是计算两个句子的某个固定数学相似度，而是把 query 和 chunk 的 token 一起送进 Transformer，
         # 通过自注意力/交叉注意力让模型学习两段文本之间的关系，最后通过一个分类/打分层输出相关性分数。
-        scores = reranker_model.predict(pairs)
-        scores = [float(s) for s in scores]
+        scores = reranker.score(pairs)
+        if scores is None:
+            return None
         #分数归一化
         min_s, max_s = min(scores), max(scores)
         if max_s - min_s > 1e-8:
@@ -272,13 +230,40 @@ class RagSummarizeService:
     # 5. 执行重排序（自动选择方案）
     # ──────────────────────────────────────────────
     def _rerank(self, query: str, docs: List[Document]) -> List[Document]:
-        if _get_bge_reranker() is not None:
-            reranked, scores = self._bge_rerank(query, docs)
-            compressed = self._compress_context(reranked, scores)
-            return compressed
-        else:
-            llm_reranked = self._llm_rerank(query, docs)
-            return self._compress_context(llm_reranked)
+        """三档策略，按「当前这个进程此刻能承担多少」选择。
+
+        这三档的区别不是精确度，而是**代价**：
+            READY    → BGE 精排（约 100~300ms，限并发、忙则被闸门拦下）
+            DISABLED/FAILED → LLM 重排（一次额外生成调用，3~5 秒，但至少排了）
+            其它（加载中/未开始）→ 直接用 RRF 顺序，一次额外调用都不花
+
+        第三档是压测里最容易被忽略的一档：模型还在加载的那 40~60 秒里，
+        如果每个请求都退到 LLM 重排，模型加载本身还没完成，
+        LLM 配额先被重排请求打满（DashScope 侧直接 429），
+        于是「等模型」变成「全线 429」。用 RRF 顺序顶这一段，
+        用户拿到的是「排序略粗但立刻返回」的答案。
+        """
+        state = reranker.state
+        if state == STATE_READY:
+            result = self._bge_rerank(query, docs)
+            if result is not None:
+                reranked, scores = result
+                return self._compress_context(reranked, scores)
+            logger.info(
+                "[重排] 精排不可用（并发已满或推理失败），保留 RRF 顺序",
+                extra={"context": {"event": "rerank.degrade", "reason": "busy_or_error"}},
+            )
+            return self._compress_context(docs[:self.final_top_k])
+
+        if state in (STATE_DISABLED, STATE_FAILED):
+            return self._compress_context(self._llm_rerank(query, docs))
+
+        # STATE_IDLE / STATE_LOADING
+        logger.info(
+            "[重排] 模型尚未就绪，本次使用 RRF 顺序",
+            extra={"context": {"event": "rerank.degrade", "reason": state}},
+        )
+        return self._compress_context(docs[:self.final_top_k])
 
     # ──────────────────────────────────────────────
     # 6. 构建最终上下文

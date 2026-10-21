@@ -9,10 +9,17 @@ __pycache__/
 # Vector DB
 chroma_db/
 rag/chroma_db/
+# 重建/迁移时的临时副本（排查用，17MB 一份，别进仓库）
+chroma_db.bak-*/
+chroma_db.docker-written-*/
+md5.text.bak-*
 *.db
 # SQLite 开了 WAL 之后会生成两个伴生文件，数据还没落进主库，误删会丢最近的写入
 *.db-wal
 *.db-shm
+
+# 多副本迁移互斥锁（运行时生成，容器间共享）
+deploy/locks/
 
 # Logs
 logs/

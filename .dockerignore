@@ -12,10 +12,18 @@ rag/chroma_db/
 .pytest_cache/
 logs/
 uploads/
+# 本地数据库不进镜像：镜像里的库是「构建那一刻的快照」，
+# 跑起来却挂载宿主 data/，两者不一致时排查会疯掉
+data/
+*.db
+*.db-wal
+*.db-shm
 md5.text
 问题记录
+# Dockerfile 自己不需要进镜像（它已经在构建上下文里被读取过）
 docker/
 docker-compose.yml
+docker-compose.dev.yml
 .github/
 tests/
 README.md

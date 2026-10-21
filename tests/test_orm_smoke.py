@@ -149,3 +149,119 @@ def test_session_scope_rolls_back_on_error(tmp_path, monkeypatch):
         assert check.get(Product, "p4") is None
 
     engine.dispose()
+
+
+# ---------- 并发建连（100 并发压测暴露的回归） ----------
+
+def test_concurrent_checkout_does_not_fail(tmp_path):
+    """40 线程同时建连，不能有任何一个抛 "unable to open database file"。
+
+    回归的是这个 bug：
+        每条新连接都执行 `PRAGMA journal_mode=WAL`。WAL 是数据库级的持久设置，
+        重复执行只是一次幂等确认，但**确认要拿短暂的独占锁**。
+        并发建连时抢不到锁，pysqlite 报的是
+        `sqlite3.OperationalError: unable to open database file`
+        ——看着像文件打不开，实际是没抢到锁。
+        修之前 100 并发打 /knowledge-bases，300 个请求 280 个 500。
+
+    这个用例故意用超过 pool_size(20) 的线程数，把「池满后新建连接」那条路也走到。
+    """
+    import concurrent.futures as cf
+
+    from sqlalchemy import text
+
+    engine = build_engine(f"sqlite:///{(tmp_path / 'conc.db').as_posix()}")
+    Base.metadata.create_all(engine)
+
+    errors: list[Exception] = []
+
+    def worker(i: int) -> None:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT :n"), {"n": i})
+        except Exception as exc:  # noqa: BLE001 —— 这里就是要抓全部
+            errors.append(exc)
+
+    try:
+        with cf.ThreadPoolExecutor(max_workers=40) as pool:
+            list(pool.map(worker, range(120)))
+    finally:
+        engine.dispose()
+
+    assert not errors, f"并发建连失败 {len(errors)} 次，首个异常：{errors[0]!r}"
+
+
+def test_wal_mode_is_actually_on(tmp_path):
+    """吞掉 journal_mode 的确认异常，不能让库最终不在 WAL 模式。"""
+    from sqlalchemy import text
+
+    engine = build_engine(f"sqlite:///{(tmp_path / 'wal.db').as_posix()}")
+    Base.metadata.create_all(engine)
+    try:
+        with engine.connect() as conn:
+            mode = conn.execute(text("PRAGMA journal_mode")).scalar()
+            busy = conn.execute(text("PRAGMA busy_timeout")).scalar()
+            fk = conn.execute(text("PRAGMA foreign_keys")).scalar()
+        assert str(mode).lower() == "wal", f"journal_mode 实际是 {mode}"
+        assert busy and int(busy) >= 1000, "busy_timeout 没设上，并发写会直接报 database is locked"
+        assert int(fk) == 1, "foreign_keys 没开，级联删除会静默失效"
+    finally:
+        engine.dispose()
+
+
+# ---------- 并发建连（100 并发压测暴露的回归） ----------
+
+def test_concurrent_checkout_does_not_fail(tmp_path):
+    """40 线程同时建连，不能有任何一个抛 "unable to open database file"。
+
+    回归的是这个 bug：
+        每条新连接都执行 `PRAGMA journal_mode=WAL`。WAL 是数据库级的持久设置，
+        重复执行只是一次幂等确认，但**确认要拿短暂的独占锁**。
+        并发建连时抢不到锁，pysqlite 报的是
+        `sqlite3.OperationalError: unable to open database file`
+        ——看着像文件打不开，实际是没抢到锁。
+        修之前 100 并发打 /knowledge-bases，300 个请求 280 个 500。
+
+    这个用例故意用超过 pool_size(20) 的线程数，把「池满后新建连接」那条路也走到。
+    """
+    import concurrent.futures as cf
+
+    from sqlalchemy import text
+
+    engine = build_engine(f"sqlite:///{(tmp_path / 'conc.db').as_posix()}")
+    Base.metadata.create_all(engine)
+
+    errors: list[Exception] = []
+
+    def worker(i: int) -> None:
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT :n"), {"n": i})
+        except Exception as exc:  # noqa: BLE001 —— 这里就是要抓全部
+            errors.append(exc)
+
+    try:
+        with cf.ThreadPoolExecutor(max_workers=40) as pool:
+            list(pool.map(worker, range(120)))
+    finally:
+        engine.dispose()
+
+    assert not errors, f"并发建连失败 {len(errors)} 次，首个异常：{errors[0]!r}"
+
+
+def test_wal_mode_is_actually_on(tmp_path):
+    """吞掉 journal_mode 的确认异常，不能让库最终不在 WAL 模式。"""
+    from sqlalchemy import text
+
+    engine = build_engine(f"sqlite:///{(tmp_path / 'wal.db').as_posix()}")
+    Base.metadata.create_all(engine)
+    try:
+        with engine.connect() as conn:
+            mode = conn.execute(text("PRAGMA journal_mode")).scalar()
+            busy = conn.execute(text("PRAGMA busy_timeout")).scalar()
+            fk = conn.execute(text("PRAGMA foreign_keys")).scalar()
+        assert str(mode).lower() == "wal", f"journal_mode 实际是 {mode}"
+        assert busy and int(busy) >= 1000, "busy_timeout 没设上，并发写会直接报 database is locked"
+        assert int(fk) == 1, "foreign_keys 没开，级联删除会静默失效"
+    finally:
+        engine.dispose()

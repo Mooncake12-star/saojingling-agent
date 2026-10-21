@@ -4,6 +4,15 @@
 业务规则（打分、排序、文案）留在 service 或调用方，事务边界由 get_db / session_scope 决定。
 """
 from repositories.conversation import ConversationRepository
+from repositories.document import DocumentRepository
+from repositories.knowledge_base import KnowledgeBaseRepository
 from repositories.product import ProductRepository
+from repositories.user import UserRepository
 
-__all__ = ["ConversationRepository", "ProductRepository"]
+__all__ = [
+    "ConversationRepository",
+    "DocumentRepository",
+    "KnowledgeBaseRepository",
+    "ProductRepository",
+    "UserRepository",
+]

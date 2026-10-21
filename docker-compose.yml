@@ -1,10 +1,42 @@
+# 三个服务：nginx（入口）→ app（应用）→ redis（缓存）
+#
+# 和上一版的差别（面试会被问「为什么改」）：
+#   旧版把宿主目录 bind mount 到 /app 并开 --reload，本质是「用容器跑 dev」；
+#   新版镜像自包含，只有**需要持久化的状态**走 volume：
+#       data/       SQLite 库
+#       chroma_db/  向量库
+#       uploads/    用户上传的原文件
+#       logs/       本地排查用（容器里同时走 stdout）
+#   这样 `docker compose up` 起来的是能给别人访问的东西，而不是绑着源码的开发环境。
+#   想热更新开发：用 `docker compose -f docker-compose.yml -f docker-compose.dev.yml up`。
+name: saojingling
+
 services:
   redis:
-    image: redis
+    image: redis:7-alpine
     container_name: saojingling-redis
-    ports:
-      - "6379:6379"
+    # appendonly：开 AOF，容器重启后缓存还在（缓存丢了也能用，但演示时更稳）
+    # maxmemory + allkeys-lru：给 256MB 上限，满了按 LRU 淘汰。
+    #   绝不让缓存把宿主机内存吃满——缓存是加速器，不是数据库
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      # app 等这一条变 healthy 才启动：应用启动时会连一次 Redis，
+      # 早于它就绪会白打一条「连接失败」的告警
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     restart: unless-stopped
+    # 不映射到宿主机：缓存不该被公网或宿主机其它程序直接访问
 
   app:
     build:
@@ -14,16 +46,108 @@ services:
         - HTTP_PROXY=${HTTP_PROXY:-}
         - HTTPS_PROXY=${HTTPS_PROXY:-}
         - NO_PROXY=${NO_PROXY:-}
-    container_name: saojingling-agent
-    ports:
-      - "8000:8000"
+        # 0 = 不在构建时预热模型（内存小的构建机用），1 = 预热（生产推荐）
+        - PRELOAD_MODEL=${PRELOAD_MODEL:-1}
+        # 国内服务器构建时在 .env 里设 PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+        - PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.org/simple}
+        - TORCH_INDEX_URL=${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}
+    image: saojingling-agent:local
+    # 不设 container_name，否则 `docker compose up --scale app=2` 会直接报
+    # "container name already in use"——固定容器名和多副本在 compose 里互斥。
+    # 需要按名字看日志时用 `docker compose logs -f app`（会带上副本序号）
+    #
+    # 副本数由 ZST_APP_REPLICAS 控制。默认 1 是**有意的**：
+    #   每个副本都要各自加载一份 1.5GB 重排模型 + 约 700MB 基础占用，
+    #   2C4G 上开 2 个必然 OOM。想开多副本，先把机器加到 4C8G 以上，
+    #   并同时切 PostgreSQL（SQLite 单文件无法跨容器共享）。
+    #   完整做法见 docker-compose.ha.yml
+    deploy:
+      replicas: ${ZST_APP_REPLICAS:-1}
+    # required: false —— .env 是 gitignore 的，克隆下来的人还没有它。
+    # 不让它挡住 `docker compose config` / `up`，缺的变量由下面 environment 里
+    # 的 :? 语法明确报错，报错信息也比 compose 找不到文件更容易看懂
+    env_file:
+      - path: .env
+        required: false
     environment:
-      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
-      - REDIS_HOST=redis
-      - NO_PROXY=localhost,127.0.0.1
+      # 密钥从宿主机环境 / .env 传进来，**不写进镜像层**。
+      # :? 表示缺了就报错退出——带着空 key 启动只会得到一个「每次调用都 401」的服务
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:?请在 .env 或当前 shell 里设置 DASHSCOPE_API_KEY}
+      DASHSCOPE_BASE_URL: ${DASHSCOPE_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      # 运行时下载模型也要走国内镜像（构建期才设 env 是没用的，
+      # 没预热模型时下载发生在运行期）
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://hf-mirror.com}
+      # 四斜杠 = sqlite:/// + 绝对路径 /app/...，少一个斜杠就会变成相对路径。
+      # 换 PostgreSQL 时覆盖这一条即可（见 docker-compose.ha.yml）：
+      #   postgresql+psycopg://user:pass@postgres:5432/saojingling
+      ZST_DB_URL: ${ZST_DB_URL:-sqlite:////app/data/app.db}
+      ZST_REDIS_URL: redis://redis:6379/0
+      # 容器里日志交给 docker 收集，不再落文件（根文件系统可以更干净）
+      ZST_LOG_FORMAT: json
+      ZST_LOG_TO_FILE: "0"
+      TZ: ${TZ:-Asia/Shanghai}
+      # 用 :? 语法：没在 .env 里设就直接报错退出。
+      # 缺 JWT 密钥时不该「悄悄用开发默认值」上线——那等于所有 token 都能被伪造
+      ZST_JWT_SECRET: ${ZST_JWT_SECRET:?请先在 .env 里设置 ZST_JWT_SECRET（至少 32 字节）}
+      # 邀请码：留空 = 注册不设防（本地/内网）；公网部署必须设，
+      # 否则陌生人注册一次就能拿你的 DASHSCOPE_API_KEY 额度跑模型
+      ZST_INVITE_CODE: ${ZST_INVITE_CODE:-}
+      # ── 并发与过载保护（改这些值前先看 docs 里的容量估算）──
+      # 同时进行的对话数上限。超出后排队 3 秒仍无位子就返回 503 + Retry-After
+      ZST_CHAT_CONCURRENCY: ${ZST_CHAT_CONCURRENCY:-16}
+      ZST_CHAT_QUEUE_TIMEOUT: ${ZST_CHAT_QUEUE_TIMEOUT:-3}
+      # 重排模型同时推理的线程数。2C4G 上 2 是上限，调大只会互相拖慢
+      ZST_RERANK_CONCURRENCY: ${ZST_RERANK_CONCURRENCY:-2}
+      # 每个请求新建 Agent（历史从库读），多副本必须为 1
+      ZST_AGENT_STATELESS: ${ZST_AGENT_STATELESS:-1}
+      # 缓存多少个检索范围对应的 RAG 实例
+      ZST_RAG_MAX_SCOPES: ${ZST_RAG_MAX_SCOPES:-8}
+      # 等锁/迁移的互斥目录（多副本共享同一目录才有意义）
+      ZST_MIGRATION_LOCK_DIR: /app/locks
     volumes:
-      - .:/app
+      - ./data:/app/data
+      - ./chroma_db:/app/chroma_db
+      - ./uploads:/app/uploads
+      - ./logs:/app/logs
+      # 迁移互斥锁：同一宿主机上的多个副本共享这个目录，flock 才生效
+      - ./deploy/locks:/app/locks
+      # 模型权重缓存：镜像里预下载过，这里兜底防止运行时再下
+      - hf_cache:/root/.cache/huggingface
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # /healthz 只证明进程活着；/readyz 才回答「能不能接流量」
+      # （数据库可读 + MCP 已就绪）。编排层用它做就绪判断，
+      # 数据库断了或 MCP 没起来时不要往这个副本发请求。
+      #
+      # 注意 /readyz 里**不包含**重排模型：它不可用时检索降级为 RRF 顺序，
+      # 功能仍可用。让一个可选优化项决定副本生死，只会造成无谓的滚动重启
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/readyz"]
+      interval: 10s
+      timeout: 3s
+      start_period: 90s
+      retries: 5
     restart: unless-stopped
-    command: uvicorn fastapi_app.main:app --host 0.0.0.0 --port 8000 --reload
+    expose:
+      - "8000"
+
+  nginx:
+    # 必须 pin 到 1.27.3+：deploy/nginx.conf 里 upstream 的 `server ... resolve`
+    # 是 1.27.3 才开源的特性。用浮动 tag（1.27-alpine）拉到旧版本会直接启动失败，
+    # 而且报错信息只说 "invalid parameter resolve"，很难联想到版本问题
+    image: nginx:1.27.5-alpine
+    container_name: saojingling-nginx
+    ports:
+      # 默认 8080：本地不会撞上 Windows/Linux 上可能被占用的 80。
+      # 公网部署在 .env 里设 ZST_HTTP_PORT=80，浏览器就能直接 http://IP 访问，不用带端口
+      - "${ZST_HTTP_PORT:-8080}:80"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  hf_cache:

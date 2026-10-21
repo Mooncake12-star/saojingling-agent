@@ -18,6 +18,10 @@ class ChatRequest(BaseModel):
     image_path: str | None = Field(default=None, description="/upload 返回的绝对路径")
     # 会话隔离：前端每个会话传一个自己的 id；不传则落到 "default"
     session_id: str | None = None
+    # 检索范围：只在这个知识库里找答案。
+    # 不传则检索「自己的文档 + 内置公共资料」——不是全库，全库会跨用户泄漏。
+    # 归属仍由 token 校验：传别人的 kb_id 会得到 404，不是 403。
+    knowledge_base_id: int | None = None
 
 
 class ChatResponse(BaseModel):
@@ -28,6 +32,10 @@ class StatusResponse(BaseModel):
     status: str
     mcp_connected: bool
     rag_ready: bool
+    # 缓存后端状态：off / redis / redis(circuit-open) / redis(unavailable)。
+    # 放进健康检查是为了让「缓存挂了但服务还在跑」这件事在监控上一眼可见，
+    # 而不是等用户反馈「列表怎么变慢了」才发现
+    cache: str = "off"
 
 
 class ClearHistoryResponse(BaseModel):

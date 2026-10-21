@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from fastapi.responses import RedirectResponse
 
 from fastapi_app.deps import manager
+from fastapi_app.services import cache as cache_service
 from schemas import StatusResponse
 
 router = APIRouter(tags=["运维"])
@@ -28,4 +29,5 @@ async def health_check() -> StatusResponse:
         status="ok" if manager.is_ready else "degraded",
         mcp_connected=manager._mcp_started,
         rag_ready=manager._rag_ready,
+        cache=cache_service.get_cache().backend(),
     )

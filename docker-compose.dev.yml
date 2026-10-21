@@ -1,0 +1,13 @@
+# 开发用覆盖文件：热更新 + 源码挂载
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+# 只在开发时用。它会把宿主目录盖到 /app 上（源码改动立刻生效），
+# 代价是「镜像里装的东西」和「实际跑的代码」可能不一致，
+# 所以生产部署绝不能用这个文件。
+services:
+  app:
+    volumes:
+      - .:/app
+      - hf_cache:/root/.cache/huggingface
+    command: uvicorn fastapi_app.main:app --host 0.0.0.0 --port 8000 --reload

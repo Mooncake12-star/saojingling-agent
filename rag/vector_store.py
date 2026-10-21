@@ -37,8 +37,35 @@ class VectorStoreService:
             #按照字符数计算长度
             length_function=len
         )
-    def get_retriever(self):
-        return self.vector_store.as_retriever(search_kwargs={'k': chroma_conf['k']})
+    def get_retriever(self, where: dict | None = None):
+        """向量检索器。
+
+        where 是 Chroma 的过滤表达式（见 rag/scope.py）。
+        不传就是全库检索——只有脚本、评测这类没有用户身份的场合才该这么用，
+        请求链路上必须传，否则等于没有隔离。
+        """
+        search_kwargs = {'k': chroma_conf['k']}
+        if where:
+            search_kwargs['filter'] = where
+        return self.vector_store.as_retriever(search_kwargs=search_kwargs)
+
+    def get_documents(self, where: dict | None = None) -> list[Document]:
+        """按范围取出全部 chunk，用来构建 BM25 索引。
+
+        BM25 是「全文统计」，没法像向量检索那样边查边过滤，
+        必须先把候选集合完整取出来建索引。所以这一步的范围过滤
+        和向量检索一样重要——漏了它，混合检索里就有一半是别人的数据。
+        """
+        kwargs = {"include": ["documents", "metadatas"]}
+        if where:
+            kwargs["where"] = where
+        data = self.vector_store.get(**kwargs)
+        texts = data.get("documents", []) or []
+        metadatas = data.get("metadatas", []) or []
+        return [
+            Document(page_content=text, metadata=meta or {})
+            for text, meta in zip(texts, metadatas or [{}] * len(texts))
+        ]
 
     def load_document(self):
         '''
@@ -98,6 +125,11 @@ class VectorStoreService:
                     logger.warning(f'[加载知识库]{path}分片后内没有有效文本内容，跳过')
                     continue
                 #将内容存入向量库，add_documents接收多个 Document，并负责把这些 Document 批量处理后加入向量数据库。
+                # 内置资料不属于任何用户：打上 is_public，检索时用
+                # {user_id: 我} OR {is_public: true} 就能让所有人看到它们，
+                # 又不会看到别人上传的文档（见 rag/scope.py）
+                for doc in split_document:
+                    doc.metadata = {**(doc.metadata or {}), "is_public": True}
                 self.vector_store.add_documents(split_document)
 
                 #记录这个已经处理过的文件的MD5，避免下次重复加载

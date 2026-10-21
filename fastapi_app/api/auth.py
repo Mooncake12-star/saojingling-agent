@@ -43,10 +43,15 @@ router = APIRouter(prefix="/auth", tags=["鉴权"])
 )
 def register(body: RegisterRequest, db: Session = Depends(get_db)) -> UserRead:
     try:
-        user = auth_service.register(db, body.email, body.password)
+        user = auth_service.register(db, body.email, body.password, body.invite_code)
         # get_db 只负责回滚和关闭，不自动提交：提交时机由业务决定，
         # 这样一个请求里的多次写可以一起成功或一起失败。
         db.commit()
+    except auth_service.InvalidInviteCode as exc:
+        # 403 而不是 400/401：请求格式没问题、也不需要「登录」，纯粹是没有权限进门。
+        # 401 会让前端弹「请重新登录」，把用户引到错误的方向
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
     except auth_service.EmailTaken as exc:
         db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc

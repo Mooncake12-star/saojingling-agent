@@ -61,7 +61,8 @@ from utils.path_tool import ensure_project_root_in_syspath
 
 ensure_project_root_in_syspath()
 
-from rag.rag_service import RagSummarizeService, _get_bge_reranker
+from rag.rag_service import RagSummarizeService
+from rag.reranker import reranker
 from rag.vector_store import VectorStoreService
 from utils.logger_handler import logger
 
@@ -245,7 +246,7 @@ def main():
 
     # 关键前置检查：BGE 加载失败时 _bge_rerank 会「静默」降级成 LLM 重排，
     # 那样配置 C 实际测的是 LLM 重排，数字是假的。必须先卡住。
-    if _get_bge_reranker() is None:
+    if not reranker.warmup(wait=True, timeout=180):
         print("[中止] BGE Reranker 不可用——配置 C 会静默降级为 LLM 重排，结论不可比。")
         print("       请确认 sentence-transformers 已安装且模型可正常加载。")
         sys.exit(1)

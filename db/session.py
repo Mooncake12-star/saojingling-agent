@@ -39,39 +39,96 @@ def get_database_url() -> str:
     return f"sqlite:///{get_abs_path(DEFAULT_DB_FILE)}"
 
 
+def _install_sqlite_pragmas(target_engine: Engine) -> None:
+    """为**某一个** Engine 的每条新连接设置 PRAGMA。
+
+    必须按 engine 装，不能只在模块级 engine 上装：
+        build_engine() 还会被测试、 alembic、将来的多库场景调用，
+        如果 PRAGMA 只挂在模块级 engine 上，那些 engine 上的
+        ON DELETE CASCADE 会静默失效——不报错，只是孤儿行留下来。
+        （这个坑是在写知识库级联删除测试时踩到的。）
+
+    放在 connect 事件里而不是建库时执行一次，是因为 WAL 是「按数据库」生效，
+    而 foreign_keys 是「按连接」生效——每个新连接都要重新打开。
+    """
+    if target_engine.dialect.name != "sqlite":
+        return
+
+    @event.listens_for(target_engine, "connect")
+    def _set_sqlite_pragma(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA foreign_keys=ON")
+            # busy_timeout：写锁被占时先等 5 秒再报 database is locked，
+            # 而不是立刻失败。并发写（每轮对话都要落两条消息）时，
+            # 这一条决定的是「慢一点」还是「直接 500」
+            cursor.execute("PRAGMA busy_timeout=5000")
+            # journal_mode=WAL 本来是**数据库级**的持久设置，设一次永久生效，
+            # 之后每条新连接执行它只是幂等确认。
+            #
+            # 但「确认」这个动作本身要拿一次短暂的独占锁。100 并发建连时抢不到，
+            # pysqlite 会抛 sqlite3.OperationalError: unable to open database file
+            # ——报错文字有误导性，实际是「这次确认没抢到锁」，不是库文件打不开。
+            # 压测实测：100 并发打 /knowledge-bases，300 个请求 280 个 500，
+            # 全挂在建连接的第一条 PRAGMA 上。
+            #
+            # 所以这里必须吞掉：库早就是 WAL 了，确认失败不影响正确性；
+            # 真需要切模式的那一次发生在启动阶段（没有并发），不会走到这里。
+            try:
+                cursor.execute("PRAGMA journal_mode=WAL")
+            except Exception:
+                pass
+        finally:
+            cursor.close()
+
+
 def build_engine(url: str | None = None) -> Engine:
-    """按 URL 创建 Engine，SQLite 会自动补上必需的连接参数。"""
+    """按 URL 创建 Engine，SQLite 会自动补上必需的连接参数与 PRAGMA。"""
     url = url or get_database_url()
     connect_args: dict[str, object] = {}
+    kwargs: dict[str, object] = {}
     if url.startswith("sqlite"):
         # FastAPI 的同步依赖可能在不同线程取连接，sqlite3 默认禁止跨线程复用
         connect_args["check_same_thread"] = False
-    return create_engine(
+        # 文件库默认是 QueuePool(5 + 10)，也就是最多 15 条连接。
+        # anyio 的工作线程默认 40 个，100 并发时后 85 个请求要排队等连接，
+        # 等满 pool_timeout=30 秒才报错——用户看到的就是「卡死然后 500」。
+        # WAL 下读读、读写都不互斥，只有写写互斥，所以连接可以开多：
+        # 20 + 20 = 40，正好等于线程池上限，不会出现「有线程但拿不到连接」。
+        # 内存库（测试用）不吃连接数，保持默认。
+        if ":memory:" not in url:
+            kwargs.update(
+                pool_size=20,
+                max_overflow=20,
+                # 等 10 秒还拿不到连接就报错，而不是让请求挂 30 秒
+                pool_timeout=10,
+            )
+    elif url.startswith("postgresql"):
+        # PostgreSQL 下连接不是「越多越好」：每条占用服务端一个 backend 进程，
+        # max_connections 默认 100，多副本共享。
+        # 10+10=20 条/副本，2 副本 40 条，留足余量。
+        #
+        # pool_recycle：PG 侧可能因超时/重启断掉空闲连接，
+        # 定期回收避免拿到「看起来活着但已被服务端关闭」的 socket
+        # （pool_pre_ping 也能兜住，但每次 checkout 都多一次往返）
+        kwargs.update(
+            pool_size=10,
+            max_overflow=10,
+            pool_timeout=10,
+            pool_recycle=1800,
+        )
+    new_engine = create_engine(
         url,
         echo=False,
         pool_pre_ping=True,
         connect_args=connect_args,
+        **kwargs,
     )
+    _install_sqlite_pragmas(new_engine)
+    return new_engine
 
 
 engine = build_engine()
-
-
-@event.listens_for(engine, "connect")
-def _set_sqlite_pragma(dbapi_connection, _connection_record) -> None:
-    """每条新连接建立时统一设置 PRAGMA。
-
-    放在事件里而不是建库时执行一次，是因为 WAL 是「按数据库」生效，
-    而 foreign_keys 是「按连接」生效——每个新连接都要重新打开。
-    """
-    if engine.dialect.name != "sqlite":
-        return
-    cursor = dbapi_connection.cursor()
-    try:
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA journal_mode=WAL")
-    finally:
-        cursor.close()
 
 
 # expire_on_commit=False：commit 之后对象仍可读，否则 FastAPI 序列化响应时
