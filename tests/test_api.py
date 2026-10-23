@@ -1,5 +1,25 @@
 import os, sys
+import uuid
+
 import pytest
+
+
+def _ensure_default_db_tables():
+    """为直接构造 ReactAgent 的用例兜底建表。
+
+    ReactAgent 构造时会读会话历史（load_window），默认库文件是
+    data/app.db。本地开发环境这个文件早已存在、表也齐全；但 CI 的
+    干净 checkout 里既没有这个文件也没有表结构（它被 gitignore，
+    表结构由 Alembic 管理），构造 Agent 就会报 no such table。
+
+    这里对默认 engine 幂等建一次表：本地库已存在时 create_all
+    是 no-op，CI 上则创建临时库文件，测试结束随 runner 丢弃。
+    """
+    import models  # noqa: F401 —— 必须 import，模型才会注册进 Base.metadata
+    from db.base import Base
+    from db.session import engine
+
+    Base.metadata.create_all(engine)
 
 
 class TestFastAPISchemas:
@@ -51,7 +71,7 @@ class TestReactAgent:
         assert mgr.session is None
 
     def test_agent_init(self):
-        import uuid
+        _ensure_default_db_tables()
         from agent.react_agent import ReactAgent
         # 用唯一 session_id，避免读到本地历史库导致 conversation_history 非空
         agent = ReactAgent(session_id="pytest-%s" % uuid.uuid4().hex[:8])
