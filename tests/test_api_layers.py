@@ -104,7 +104,8 @@ class _FakeManager:
 async def test_stream_sse_frames():
     frames = [f async for f in chat_service.stream_sse(1, "hi", agent_manager=_FakeManager())]
 
-    assert frames[0] == "data: 你\n\n".encode()
+    # chunk 经 json.dumps 编码后再进 data:（防换行破坏 SSE 帧），前端 json.loads 还原
+    assert frames[0] == 'data: "你"\n\n'.encode()
     assert frames[-1] == b"data: [DONE]\n\n"
 
 

@@ -5,10 +5,10 @@
 [![Tests](https://img.shields.io/badge/tests-173%20passed-brightgreen)](tests/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-面向扫地机器人 / 扫拖一体机器人的智能客服 Agent：**ReAct Agent + RAG + MCP + FastAPI + Redis + SQL**。
+面向扫地机器人 / 扫拖一体机器人的智能客服 Agent：**ReAct Agent + RAG + MCP + FastAPI + React + Redis + SQL**。
 
-不只是「调通一个模型」：它带 JWT 多租户鉴权、知识库异步入库、四层检索隔离、request_id 全链路日志、
-过载背压与多副本部署方案，并且有 173 个测试兜住这些行为。
+不只是「调通一个模型」：它带 JWT 多租户鉴权、React 前端（SSE 流式对话）、知识库异步入库、四层检索隔离、
+request_id 全链路日志、过载背压与多副本部署方案，并且有 173 个测试兜住这些行为。
 
 - 业务代码约 7.7k 行（Python），测试代码约 3.7k 行
 - 25 条路由（24 个接口 + 根路径重定向）、6 张表、4 个 Alembic 迁移
@@ -36,8 +36,8 @@
 ## 架构
 
 ```
-浏览器 / Streamlit
-        │  HTTP + JWT
+浏览器（React 前端） / Streamlit（本地调试）
+        │  HTTP + JWT（SSE 流式对话）
         ▼
    nginx（容器部署，注入 / 透传 X-Request-ID）
         │
@@ -62,7 +62,8 @@ FastAPI ── 纯 ASGI 中间件：request_id → ContextVar → 日志 / 响�
 
 | 模块 | 技术 |
 |---|---|
-| 前端界面 | Streamlit（本地调试用，详见[已知边界](#已知边界)） |
+| Web 前端 | React 18 + TypeScript + Vite（`web/`，登录 / SSE 流式对话 / 知识库管理，走完整 HTTP 链路） |
+| 本地调试界面 | Streamlit（直连函数不走 HTTP，详见[已知边界](#已知边界)） |
 | API 服务 | FastAPI + Uvicorn |
 | AI Agent | LangChain ReAct Agent |
 | 工具协议 | MCP (Model Context Protocol)，stdio 方式 |
@@ -139,6 +140,18 @@ uvicorn fastapi_app.main:app --host 0.0.0.0 --port 8000
 streamlit run app.py
 ```
 
+**React Web 前端（正式界面）：**
+
+```bash
+cd web
+npm install        # 首次
+npm run dev        # http://localhost:5173（/api 自动代理到 :8000）
+```
+
+前端功能：注册登录（JWT 双 Token，401 自动刷新）、SSE 流式对话（打字机效果、可中止）、
+知识库管理（新建 / 删除 / 文档上传与状态）。开发模式由 Vite 代理转发避免跨域；
+生产环境 `npm run build` 产出 `dist/` 静态文件，交给 nginx 托管即可。
+
 ### 4. 跑起来后怎么验证
 
 ```bash
@@ -206,6 +219,11 @@ Docker Compose 专用（只在 `.env` 里生效，进程读不到）：`ZST_HTTP
 
 ```
 ├── app.py                      # Streamlit 前端入口（直连函数，不走 HTTP）
+├── web/                        # React 18 + TypeScript 前端（走完整 HTTP 链路）
+│   ├── src/api.ts              # 请求层：JWT 自动刷新、SSE 流式解析（JSON 编码帧）
+│   ├── src/pages/              # 登录 / 聊天（SSE 气泡）/ 知识库管理
+│   ├── vite.config.ts          # 开发代理：/api → localhost:8000
+│   └── package.json
 ├── agent/
 │   ├── react_agent.py          # ReAct Agent + MCP 上下文管理 + 会话历史
 │   └── tools/
@@ -257,13 +275,17 @@ Docker Compose 专用（只在 `.env` 里生效，进程读不到）：`ZST_HTTP
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/chat/stream` | SSE 流式对话 |
+| POST | `/chat/stream` | SSE 流式对话（每帧 `data: <JSON 编码的文本片段>`，`data: [DONE]` 结束） |
 | POST | `/chat` | 一次性返回完整回答 |
 | GET | `/history/sessions` | 当前用户的会话列表 |
 | POST | `/history/clear` | 清空某个会话历史 |
 
 请求体四个字段：`query`、`image_path`、`session_id`、`knowledge_base_id`。
 `knowledge_base_id` 不传则检索「自己的文档 + 内置公共资料」；传别人的库返回 404（不是 403，避免探测库是否存在）。
+
+SSE 帧里的文本片段经 `json.dumps` 编码后再发——模型输出是 markdown、必然带换行，
+而裸换行会撕碎 SSE 的消息边界（`\n\n` 是帧分隔），直接拼会导致前端只收到第一段。
+前端 `json.loads` 还原即可，任何字符都不会破坏帧结构。
 
 **知识库**
 
@@ -463,12 +485,21 @@ MCP 返回的是 JSON Schema 字典，LangChain 需要带 Pydantic 模型的 Too
 现在的做法：懒获取 + 5 秒熔断 + 30 秒冷却重试 + `backend()` 真探测（`off / redis / redis(circuit-open) / redis(unavailable)`）。
 脏数据（不是合法 JSON）当 miss 处理，不让一条坏缓存把接口打挂。
 
+### 10. SSE 帧里的内容必须 JSON 编码，不能裸拼
+
+`stream_sse` 最初直接 `f"data: {chunk}\n\n"`——模型输出是 markdown、必然带换行，
+而 `\n\n` 是 SSE 的消息边界，内容里的换行会撕碎帧结构：后端日志完整，前端却只收到第一段
+（React 前端联调时真实踩到）。修复：`data: {json.dumps(chunk, ensure_ascii=False)}`，
+换行转义成 `\n` 两个字符，任何内容都不破帧；前端 `json.loads` 还原。教训：
+**SSE 的 `data:` 载荷只适合单行文本，多行/富文本一律先编码再发。**
+
 ## 已知边界
 
 诚实列清楚，比假装全做了更有用：
 
 1. **Streamlit 前端不走后端**。`app.py` 直接 `import ReactAgent` 调函数，不过 HTTP、不登录、不带检索范围。
-   后端的鉴权、隔离、限流它一个都没用上——它是本地调试界面，不是生产前端。要对外开放请接 REST API。
+   后端的鉴权、隔离、限流它一个都没用上——它是本地调试界面，不是生产前端。
+   **正式界面是 `web/` 下的 React 前端**：走完整 HTTP 链路（JWT + SSE），鉴权、隔离、限流全部生效。
 2. **单机部署**。单副本时 SQLite 是单写锁，重启即不可用。多副本方案（PG + 2 副本）解决了「进程崩」，
    解决不了「机器挂」；PG 和 Redis 都是单实例，本身是新的单点。
 3. **没有 HTTPS**。公网演示只有 IP + http，JWT 在链路上是明文。要上 HTTPS 需要域名（国内还要备案）加证书。

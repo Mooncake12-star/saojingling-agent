@@ -41,6 +41,12 @@ uploads/
 #test
 .pytest_cache/
 
+# Frontend（web/）：node_modules 几千个依赖文件可由 npm install 复原；
+# dist 是构建产物，部署时在服务器上重新 npm run build，都不进仓库
+web/node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
+
 # Personal notes
 问题记录
 项目技术总结.md

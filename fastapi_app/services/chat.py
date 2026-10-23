@@ -10,6 +10,7 @@ P2 之后多了一个 user_id：它不是可选的装饰参数，而是取 Agent
 """
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import AsyncGenerator
 
@@ -65,15 +66,21 @@ async def stream_sse(
     agent_manager: AgentManager | None = None,
     knowledge_base_id: int | None = None,
 ) -> AsyncGenerator[bytes, None]:
-    """产出完整的 SSE 帧：`data: <chunk>\\n\\n`，结尾补 `[DONE]`。
+    """产出完整的 SSE 帧：`data: <json 字符串>\\n\\n`，结尾补 `[DONE]`。
 
     为什么要显式发 [DONE]：EventSource 只认服务端关闭连接，
     前端如果不解析结束标记，就只能靠 onerror 判断结束，会把正常结束当成错误。
+
+    为什么 chunk 要过 json.dumps：SSE 规定一条消息里不能有裸换行
+    （\\n\\n 是消息边界），而模型输出的是 markdown、必然带换行——
+    直接拼的话换行会撕碎帧结构，前端只能收到第一段。
+    JSON 编码把换行转义成 \\n 两个字符，内容再长再怪都不破帧；
+    前端拿到后 json.loads 还原即可。
     """
     async for chunk in stream_chunks(
         user_id, query, image_path, session_id, agent_manager, knowledge_base_id
     ):
-        yield f"data: {chunk}\n\n".encode("utf-8")
+        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
     yield b"data: [DONE]\n\n"
 
 
