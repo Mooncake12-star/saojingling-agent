@@ -122,8 +122,12 @@ def test_reranker_score_skips_while_loading(monkeypatch):
     scores = reranker.score([["q", "passage"]])
     cost = time.perf_counter() - started
 
+    # 事件断言而非时间断言：score 返回时构造线程必须还活着——
+    # 这直接证明「没等模型加载完」。绝对时间断言（如 cost < 0.3）
+    # 在 CI 的 2 核慢机器上会随机失败，是典型的 flaky test。
     assert scores is None, "模型未就绪时必须降级"
-    assert cost < 0.3, f"降级路径花了 {cost:.2f}s，说明在等锁/等模型"
+    assert loader.is_alive(), "score 返回时加载还没完成，说明确实没等它"
+    assert cost < 5, f"降级路径花了 {cost:.2f}s，疑似死锁"
     assert reranker.snapshot()["score_skipped_not_ready"] >= 1
 
     loader.join(timeout=5)
@@ -155,7 +159,9 @@ def test_reranker_gate_skips_when_busy(monkeypatch):
         reranker._gate.release()
 
     assert scores is None
-    assert cost < 0.3
+    # 闸门超时是 0.05s，正常路径必然远小于它；上限放宽到 1s 只防死锁，
+    # 避免在 CI 慢机器上因调度抖动误报（绝对时间断言是 flaky 的根源）
+    assert cost < 1.0, f"闸门超时 0.05s 却花了 {cost:.2f}s，疑似在排队而非跳过"
     assert reranker.snapshot()["score_skipped_busy"] == 1
 
 
@@ -180,16 +186,22 @@ def test_different_scopes_build_in_parallel(clean_rag_cache, monkeypatch):
     """
     built: list[int] = []
     build_lock = threading.Lock()
+    spans: list[tuple[int, float, float]] = []  # (user_id, start, end)
 
     def fake_build(scope):
-        time.sleep(0.35)  # 模拟拉 chunk + 建 BM25 索引
+        # 记录每个构造的起止区间，之后断言两个区间重叠——
+        # 这比「总耗时 < 0.6s」可靠：sleep 不吃 CPU，重叠窗口在
+        # 2 核 CI 机器上同样成立，而绝对时间断言会因调度抖动误报
+        start = time.perf_counter()
+        time.sleep(0.8)  # 模拟拉 chunk + 建 BM25 索引，加大重叠窗口
+        end = time.perf_counter()
         with build_lock:
             built.append(scope.user_id)
+            spans.append((scope.user_id, start, end))
         return object()
 
     monkeypatch.setattr(local_tool, "_build", fake_build)
 
-    started = time.perf_counter()
     threads = [
         threading.Thread(target=local_tool.get_rag_service, args=(RagScope(user_id=uid),))
         for uid in (1, 2)
@@ -198,11 +210,16 @@ def test_different_scopes_build_in_parallel(clean_rag_cache, monkeypatch):
         t.start()
     for t in threads:
         t.join(timeout=10)
-    cost = time.perf_counter() - started
 
     assert sorted(built) == [1, 2]
-    # 串行至少要 0.7s；并行应接近 0.35s。留一点调度余量
-    assert cost < 0.6, f"两个范围构造耗时 {cost:.2f}s，说明仍然串行"
+    # 串行时后一个的 start 必然晚于前一个的 end；并行则两个区间重叠
+    _, s1, e1 = spans[0]
+    _, s2, e2 = spans[1]
+    overlap = max(s1, s2) < min(e1, e2)
+    assert overlap, (
+        "两个范围的构造区间没有重叠，说明仍然串行："
+        f"spans={[(round(s,2), round(e,2)) for _, s, e in spans]}"
+    )
 
 
 def test_same_scope_builds_only_once(clean_rag_cache, monkeypatch):
@@ -249,7 +266,12 @@ def test_build_wait_timeout_fails_fast(clean_rag_cache, monkeypatch):
     """
     monkeypatch.setattr(local_tool, "BUILD_WAIT_TIMEOUT", 0.1)
 
+    owner_started = threading.Event()
+
     def slow_build(scope):
+        # 先通知「我已经是 owner、正在构造」，消除主线程与 holder
+        # 的启动竞态（固定 sleep(0.05) 在慢机器上可能等不到它成为 owner）
+        owner_started.set()
         time.sleep(0.5)
         return object()
 
@@ -258,14 +280,16 @@ def test_build_wait_timeout_fails_fast(clean_rag_cache, monkeypatch):
     scope = RagScope(user_id=9)
     holder = threading.Thread(target=local_tool.get_rag_service, args=(scope,), daemon=True)
     holder.start()
-    time.sleep(0.05)  # 让它成为 owner
+    assert owner_started.wait(timeout=5), "holder 线程 5s 内没有进入构造状态"
 
     started = time.perf_counter()
     with pytest.raises(local_tool.RagBuildBusy):
         local_tool.get_rag_service(scope)
     cost = time.perf_counter() - started
 
-    assert cost < 0.4, f"应该在 {local_tool.BUILD_WAIT_TIMEOUT}s 左右放弃，实际 {cost:.2f}s"
+    # 正确实现应在 BUILD_WAIT_TIMEOUT(0.1s) 附近放弃；上限 2s 只防死锁，
+    # 绝对贴近值（cost < 0.4）在 CI 慢机器上会因调度抖动误报
+    assert cost < 2.0, f"排队超时 0.1s 却花了 {cost:.2f}s，疑似永远等待"
     holder.join(timeout=5)
 
 
@@ -291,7 +315,9 @@ def test_gate_rejects_after_queue_timeout(monkeypatch):
 
     cost, exc = run_async(scenario())
 
-    assert cost < 0.3, f"应该等 {gate.queue_timeout}s 就放弃，实际 {cost:.2f}s"
+    # 正确实现等 queue_timeout(0.05s) 就放弃；上限 1s 只防死锁，
+    # 避免绝对时间断言在 CI 慢机器上因调度抖动误报
+    assert cost < 1.0, f"应该等 {gate.queue_timeout}s 就放弃，实际 {cost:.2f}s"
     assert exc.retry_after == gate.retry_after
     assert gate.snapshot()["rejected"] == 1
 

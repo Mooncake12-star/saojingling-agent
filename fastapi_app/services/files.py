@@ -20,9 +20,14 @@ def _safe_name(filename: str | None) -> str:
 
     改造前直接用了 `file.filename` 拼路径，前端传 `../../config/agent.yml`
     就能覆盖项目里任意文件——这类漏洞叫路径穿越，是上传接口的经典问题。
-    这里用 Path(...).name 取最后一段，Windows 下的 `..\\..\\x` 同样会被去掉。
+
+    注意：必须同时处理 `/` 和 `\\` 两种分隔符，不能用 Path(...).name 直接取。
+    Path.name 依赖运行平台的路径语义——Linux 上 `\\` 是合法文件名字符，
+    `Path("..\\\\..\\\\config\\\\agent.yml").name` 不会剥掉目录成分。
+    而上传方很可能是 Windows 客户端（filename 里带反斜杠），
+    服务器却跑在 Linux 上，所以先把 `\\` 归一成 `/` 再取 basename 才可靠。
     """
-    name = Path(filename or "").name.strip()
+    name = Path((filename or "").replace("\\", "/")).name.strip()
     if not name or name in {".", ".."}:
         raise ValueError("文件名不合法")
     return name
