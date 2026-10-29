@@ -320,6 +320,74 @@ class RagSummarizeService:
     #同步调用
     def rag_summarize(self, query: str) -> str:
         return self.chain.invoke({"input": query})
+
+    # ──────────────────────────────────────────────
+    # 8. 只检索、不生成（供外部编排器调用）
+    # ──────────────────────────────────────────────
+    def retrieve(self, query: str, top_k: int | None = None) -> dict:
+        """跑完「改写 → 混合检索 → 重排 → 压缩」，但**不**调用生成模型。
+
+        为什么要有这个入口
+        ────────────────
+        Dify / Coze 这类编排平台自己就能调模型生成答案，它们真正缺的是
+        「中文 BM25 分词 + RRF 融合 + BGE 重排」这一段——也就是本项目
+        全部调优成果所在。让外部编排器只借用检索、自己负责生成，
+        两边的长项都不浪费；更重要的是：检索质量从此可以独立评测，
+        命中率不再和「生成用的那个模型」绑在一起。
+
+        和 rag_summarize 的关系
+        ──────────────────────
+        复用同一条链路上的中间结果（ensemble_retriever + _rerank），
+        不重写、不复制逻辑——否则两处检索实现迟早跑偏，
+        评测集上的 95% 就只对其中一条路径成立。
+
+        为什么返回 dict 而不是 List[Document]
+        ────────────────────────────────────
+        这个方法会被 HTTP 端点包一层发给进程外的编排器。
+        把 LangChain 的 Document 对象丢过边界，等于把框架版本
+        绑死进协议里；换成纯 dict 后，Dify 的 HTTP 节点直接就能消费。
+        """
+        # 查询改写同样要做：口语化 query 直接检索会掉分，
+        # 这是评测集里口语化难例（Hit@1 73%）的主要来源
+        rewritten = query
+        try:
+            rewrite_chain = (
+                PromptTemplate.from_template(QUERY_REWRITE_TEMPLATE)
+                | self.model
+                | StrOutputParser()
+            )
+            rewritten = (rewrite_chain.invoke({"input": query}) or query).strip().strip('"').strip("'")
+            logger.info(f"[检索接口] 原始: {query} → 改写: {rewritten}")
+        except Exception as e:
+            # 改写失败只是排序略差，不该让整个检索失败
+            logger.warning(f"[检索接口] 查询重写失败，使用原始查询: {e}")
+
+        docs = self.ensemble_retriever.invoke(rewritten)
+        logger.info(f"[检索接口] 集成检索返回 {len(docs)} 条")
+        reranked = self._rerank(query, docs)
+        if top_k:
+            reranked = reranked[:top_k]
+
+        hits = []
+        for i, doc in enumerate(reranked):
+            meta = doc.metadata or {}
+            raw_source = meta.get("source", meta.get("file_path", "未知来源"))
+            # 只回文件名，不回绝对路径：这个结果会被吐出进程边界（HTTP 响应），
+            # 带上 D:\... 既暴露了本机目录结构，对调用方也毫无用处
+            source = os.path.basename(str(raw_source)) or "未知来源"
+            hits.append(
+                {
+                    "rank": i + 1,
+                    "content": doc.page_content,
+                    "source": source,
+                    "knowledge_base_id": meta.get("knowledge_base_id"),
+                    # 分数没有透出：_rerank 内部三档（BGE / LLM / RRF 直出）
+                    # 给出的分数尺度不一致，直接暴露会让调用方误判阈值。
+                    # 排序本身就是结论，rank 足够用。
+                    "score": None,
+                }
+            )
+        return {"rewritten_query": rewritten, "hits": hits}
     #异步调用
     async def astream_rag_summarize(self, query: str) -> AsyncGenerator[str, None]:
         async for chunk in self.chain.astream({"input": query}):

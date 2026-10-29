@@ -1,0 +1,300 @@
+app:
+  description: ''
+  icon: 🤖
+  icon_background: '#FFEAD5'
+  icon_type: emoji
+  mode: advanced-chat
+  name: 扫净灵问答（Dify 复刻版）
+  use_icon_as_answer_icon: false
+dependencies:
+- current_identifier: null
+  type: marketplace
+  value:
+    marketplace_plugin_unique_identifier: langgenius/tongyi:0.2.26@6c75a6b95954ef3c97f0d3225bad7cbfbff7cdbc82d9425074aae121cc056a64
+    version: null
+kind: app
+site:
+  chat_color_theme: null
+  chat_color_theme_inverted: false
+  copyright: null
+  custom_disclaimer: ''
+  default_language: zh-Hans
+  description: null
+  icon: 🤖
+  icon_background: '#FFEAD5'
+  icon_type: emoji
+  input_placeholder: null
+  privacy_policy: null
+  show_workflow_steps: true
+  title: 扫净灵问答（Dify 复刻版）
+  use_icon_as_answer_icon: false
+version: 0.7.0
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      allowed_file_extensions:
+      - .JPG
+      - .JPEG
+      - .PNG
+      - .GIF
+      - .WEBP
+      - .SVG
+      allowed_file_types:
+      - image
+      allowed_file_upload_methods:
+      - local_file
+      - remote_url
+      enabled: false
+      fileUploadConfig:
+        attachment_image_file_size_limit: 2
+        audio_file_size_limit: 50
+        batch_count_limit: 5
+        file_size_limit: 15
+        file_upload_limit: 50
+        image_file_batch_limit: 10
+        image_file_size_limit: 10
+        knowledge_file_size_limit: 15
+        single_chunk_attachment_limit: 10
+        skill_file_size_limit: 50
+        video_file_size_limit: 100
+        workflow_file_upload_limit: 10
+      image:
+        enabled: false
+        number_limits: 3
+        transfer_methods:
+        - local_file
+        - remote_url
+      number_limits: 3
+    opening_statement: ''
+    retriever_resource:
+      enabled: true
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+      language: ''
+      voice: ''
+  graph:
+    edges:
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: start
+        targetType: http-request
+      id: 1793187401887-source-1793187496180-target
+      source: '1793187401887'
+      sourceHandle: source
+      target: '1793187496180'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: llm
+        targetType: answer
+      id: 1793187930711-source-1793187941895-target
+      source: '1793187930711'
+      sourceHandle: source
+      target: '1793187941895'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: http-request
+        targetType: code
+      id: 1793187496180-source-1793188304390-target
+      source: '1793187496180'
+      sourceHandle: source
+      target: '1793188304390'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: code
+        targetType: llm
+      id: 1793188304390-source-1793187930711-target
+      source: '1793188304390'
+      sourceHandle: source
+      target: '1793187930711'
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    nodes:
+    - data:
+        selected: false
+        title: 用户输入
+        type: start
+        variables: []
+      height: 72
+      id: '1793187401887'
+      position:
+        x: 80
+        y: 282
+      positionAbsolute:
+        x: 80
+        y: 282
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+      zIndex: 0
+    - data:
+        authorization:
+          config: null
+          type: no-auth
+        body:
+          data:
+          - id: key-value-73
+            key: ''
+            type: text
+            value: "{\n  \"query\": \"{{#sys.query#}}\",\n  \"top_k\": 3\n}"
+          type: json
+        headers: 'X-Tool-Key:sjling-demo-key
+
+          Content-Type:application/json'
+        method: post
+        params: ''
+        retry_config:
+          max_retries: 3
+          retry_enabled: true
+          retry_interval: 100
+        selected: false
+        ssl_verify: true
+        timeout:
+          connect: 10
+          max_connect_timeout: 0
+          max_read_timeout: 0
+          max_write_timeout: 0
+          read: 60
+          write: 60
+        title: HTTP 请求
+        type: http-request
+        url: https://occurring-millions-minnesota-nationally.trycloudflare.com/tools/retrieve
+        variables: []
+      height: 153
+      id: '1793187496180'
+      position:
+        x: 380
+        y: 372
+      positionAbsolute:
+        x: 380
+        y: 372
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+      zIndex: 0
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        model:
+          completion_params: {}
+          mode: chat
+          name: qwen3.7-max
+          provider: langgenius/tongyi/tongyi
+        prompt_template:
+        - id: fb0ea01b-0bdc-4639-9a9a-5b7bf24354d4
+          role: system
+          text: 你是一个扫地机器人选购助手。只依据下面提供的资料回答问题；资料中没有的内容，直接回答"资料中没有相关信息"，不要编造。
+        - id: 6a0d3143-3808-4182-8a8a-e1a08c5b239d
+          role: user
+          text: '资料：
+
+            {{#1793188304390.context#}}
+
+
+            问题：
+
+            {{#sys.query#}}'
+        selected: false
+        title: LLM 2
+        type: llm
+        vision:
+          enabled: false
+      height: 87
+      id: '1793187930711'
+      position:
+        x: 982
+        y: 372
+      positionAbsolute:
+        x: 982
+        y: 372
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+      zIndex: 0
+    - data:
+        answer: '{{#1793187930711.text#}}'
+        selected: false
+        title: 直接回复 2
+        type: answer
+        variables: []
+      height: 101
+      id: '1793187941895'
+      position:
+        x: 1284
+        y: 372
+      positionAbsolute:
+        x: 1284
+        y: 372
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+      zIndex: 0
+    - data:
+        code: "import json\n\ndef main(body: str) -> dict:\n    data = json.loads(body)\n\
+          \    hits = data.get(\"hits\", [])\n    lines = []\n    for h in hits:\n\
+          \        lines.append(\"[{}]（来源：{}）{}\".format(h[\"rank\"], h[\"source\"\
+          ], h[\"content\"]))\n    return {\"context\": \"\\n\\n\".join(lines)}\n"
+        code_language: python3
+        outputs:
+          context:
+            children: null
+            type: string
+        selected: false
+        title: 代码执行
+        type: code
+        variables:
+        - value_selector:
+          - '1793187496180'
+          - body
+          value_type: string
+          variable: body
+      height: 51
+      id: '1793188304390'
+      position:
+        x: 682
+        y: 372
+      positionAbsolute:
+        x: 682
+        y: 372
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 242
+      zIndex: 0
+    viewport:
+      x: -2842.6445240605863
+      y: -345.6751375879834
+      zoom: 2
+  rag_pipeline_variables: []
