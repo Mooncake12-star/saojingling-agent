@@ -14,9 +14,13 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 import asyncio
+from pathlib import Path
 
 from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 from utils.path_tool import ensure_project_root_in_syspath
 
@@ -73,7 +77,29 @@ app = FastAPI(
     description="基于 ReAct Agent + RAG + MCP 的智能助手后端服务",
     version="2.1.0",
     lifespan=lifespan,
+    # 默认的 /docs 和 /redoc 从 cdn.jsdelivr.net 拉 swagger-ui 的 css/js，
+    # 这个域名在部分网络下取不到，页面就退化成一堆没样式的裸 HTML 元素。
+    # 先关掉默认实现，下面用本地资源重新注册
+    docs_url=None,
+    redoc_url=None,
 )
+
+# 静态资源自托管：swagger-ui-dist 5.34.0 的三个文件放在 fastapi_app/static/swagger/，
+# 不依赖外网也能打开 /docs
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
+app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
+
+@app.get("/docs", include_in_schema=False)
+async def swagger_ui() -> HTMLResponse:
+    """交互式文档页（离线版）。"""
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url or "/openapi.json",
+        title=f"{app.title} - Swagger UI",
+        swagger_js_url="/static/swagger/swagger-ui-bundle.js",
+        swagger_css_url="/static/swagger/swagger-ui.css",
+        swagger_favicon_url="/static/swagger/favicon.png",
+    )
 
 # 前后端分离后这部分有用；生产环境要把 allow_origins 收窄到具体域名
 app.add_middleware(
