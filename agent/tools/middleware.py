@@ -9,7 +9,12 @@ from langchain.tools.tool_node import ToolCallRequest
 from langchain_core.messages import ToolMessage
 from langgraph.runtime import Runtime
 from langgraph.types import Command
+from utils.config_handler import agent_conf
 from utils.logger_handler import logger
+
+# 单次工具调用上限：MCP 子进程卡住时，async 调用会永久等待，
+# 不设上限就把整轮对话一起拖死（评测里 t036 就是这么挂的）。
+_TOOL_TIMEOUT = float((agent_conf.get("guard") or {}).get("tool_timeout", 90))
 
 #handler（request）全过程
 '''
@@ -54,11 +59,19 @@ async def monitor_tool(
 
     try:
         logger.info("=== ⚖️ 【绝对在工具执行前】 ===")
-        result = await handler(request) if asyncio.iscoroutinefunction(handler) else handler(request)
+        call = handler(request) if not asyncio.iscoroutinefunction(handler) else handler(request)
+        result = await asyncio.wait_for(call, timeout=_TOOL_TIMEOUT)
         logger.info(f"=== 🎁 【工具真实返回的结果是】：{result} ===")
         logger.info(f"[tool monitor]工具{request.tool_call['name']}调用成功")
 
         return result
+    except asyncio.TimeoutError:
+        # 超时不能往外抛：抛出去整轮对话就断了，用户什么也拿不到。
+        # 把超时变成一个"工具结果"喂回模型，让它自己降级（改用知识库或直接说明查不到），
+        # 这样 SSE 流不中断，前端还能拿到一句人话。
+        msg = f"工具{request.tool_call['name']}调用超时（>{_TOOL_TIMEOUT:.0f}s），本次未获取到结果。"
+        logger.error(f"[tool monitor]{msg} 请改用其他信息源或如实告知用户。")
+        return ToolMessage(content=msg, tool_call_id=request.tool_call.get("id", ""))
     except Exception as e:
         logger.error(f"工具{request.tool_call['name']}调用失败，原因：{str(e)}")
         raise e

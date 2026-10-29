@@ -2,3 +2,17 @@ external_data_path: data/external/records.csv
 # 多模态（图片分析）型号：DashScope 会定期下线旧型号，放配置里便于随时替换
 # 可选值参考：qwen3-vl-plus / qwen-vl-max-latest（需在百炼控制台开通）
 vl_model_name: qwen3-vl-plus
+
+# ── 运行时护栏 ────────────────────────────────────────────────
+# 起因：评测时出现过一次「导出报告后模型调用再无响应」，agent 侧没有任何上限，
+# 整轮对话就永久挂住（实测 420s 零输出，第一轮评测被拖死 77 分钟）。
+# 三层各管一件事，缺一层都还会挂：
+#   model_timeout     —— 单次模型请求的 HTTP 超时（openai SDK 默认 600s 太长）
+#   tool_timeout      —— 单次工具调用上限（MCP 子进程卡住时兜底）
+#   model_idle_timeout—— 两个流式事件之间的最大间隔（模型"连着但不出字"时兜底）
+#   max_agent_steps   —— 模型↔工具往返的最大步数（防 ReAct 死循环）
+guard:
+  model_timeout: 90
+  tool_timeout: 90
+  model_idle_timeout: 150
+  max_agent_steps: 12

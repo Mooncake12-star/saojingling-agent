@@ -8,8 +8,12 @@ from langchain_core.embeddings import Embeddings
 from langchain_openai import ChatOpenAI
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_community.chat_models.tongyi import BaseModel
-from utils.config_handler import rag_conf
+from utils.config_handler import rag_conf, agent_conf
 from utils.env_utils import DASHSCOPE_API_KEY,DASHSCOPE_BASE_URL
+
+# 运行时护栏配置（见 config/agent.yml 的 guard 段），缺配置时用保守默认值，
+# 避免"配置文件手改坏了 → 整个 agent 起不来"这种放大故障。
+_GUARD = agent_conf.get("guard") or {}
 
 class BaseModelFactory(ABC):
     @abstractmethod
@@ -19,9 +23,14 @@ class BaseModelFactory(ABC):
 
 class ChatModelFactory(BaseModelFactory):
     def generator(self) -> Optional[Union[Embeddings, BaseModel]]:
+        # timeout 必须显式给：openai SDK 默认 600s，模型侧卡住时一轮对话会挂十分钟，
+        # 实测就是这样把整批评测拖死的（420s 零输出、进程 CPU 归零）。
+        # max_retries 从默认 2 降到 1：失败要快点暴露，不要在一个坏请求上重试三轮。
         return ChatOpenAI(model=rag_conf['chat_model_name'],
                           api_key = DASHSCOPE_API_KEY,
-                          base_url = DASHSCOPE_BASE_URL)
+                          base_url = DASHSCOPE_BASE_URL,
+                          timeout = float(_GUARD.get("model_timeout", 90)),
+                          max_retries = 1)
 
 class EmbeddingModelFactory(BaseModelFactory):
     def generator(self) -> Optional[Union[Embeddings, BaseModel]]:

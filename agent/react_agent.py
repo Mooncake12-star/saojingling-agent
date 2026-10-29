@@ -7,6 +7,7 @@ ensure_project_root_in_syspath()
 from typing import AsyncGenerator, List, Dict, Any, Optional
 from model.factory import get_chat_model
 from utils.prompt_loader import load_main_prompts
+from utils.config_handler import agent_conf
 from agent.tools.middleware import monitor_tool, log_before_model
 from db.session import session_scope
 from repositories.conversation import ConversationRepository
@@ -16,6 +17,14 @@ from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, AIMessage
+from langgraph.errors import GraphRecursionError
+
+# 运行时护栏（见 config/agent.yml 的 guard 段）
+_GUARD = agent_conf.get("guard") or {}
+# 模型↔工具往返的最大步数：ReAct 的死循环不会自己停，必须由外层强制收口
+MAX_AGENT_STEPS = int(_GUARD.get("max_agent_steps", 12))
+# 两个流式事件之间的最大间隔：模型"连接还在但一个字都不吐"时，靠它把这一轮切断
+MODEL_IDLE_TIMEOUT = float(_GUARD.get("model_idle_timeout", 150))
 
 
 
@@ -426,14 +435,65 @@ class ReactAgent:
   ↓
 第 4 次循环结束（LLM 无 tool_calls，Agent 停止）
         '''
-        async for update in agent.astream(inputs, stream_mode="values"):
-            messages = update.get("messages", [])
-            if messages:
-                last = messages[-1]
-                if last.type == "ai" and not getattr(last, "tool_calls", None):
-                    if last.content:
-                        full += last.content
-                        yield last.content
+        # 三层护栏都在这里收口：
+        #   recursion_limit → 步数上限，防 ReAct 无限调工具
+        #   wait_for        → 事件间隔上限，防模型"连着但不出字"
+        #   middleware 侧   → 单次工具调用上限（见 agent/tools/middleware.py）
+        stream = agent.astream(
+            inputs,
+            stream_mode="values",
+            config={"recursion_limit": MAX_AGENT_STEPS},
+        )
+        abort_note = ""
+        try:
+            while True:
+                try:
+                    update = await asyncio.wait_for(stream.__anext__(), timeout=MODEL_IDLE_TIMEOUT)
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    abort_note = (
+                        f"（本次处理已中断：{MODEL_IDLE_TIMEOUT:.0f} 秒内模型没有返回任何内容。"
+                        f"请重试，或把问题拆成更小的步骤。）"
+                    )
+                    logger.error(f"[agent] 模型 {MODEL_IDLE_TIMEOUT:.0f}s 无响应，已中断本轮：{query[:40]}")
+                    break
+
+                messages = update.get("messages", [])
+                if messages:
+                    last = messages[-1]
+                    if last.type == "ai" and not getattr(last, "tool_calls", None):
+                        if last.content:
+                            full += last.content
+                            yield last.content
+        except GraphRecursionError:
+            abort_note = (
+                f"（本次处理已中断：工具往返超过 {MAX_AGENT_STEPS} 步仍未得出结论，"
+                f"为避免无限调用已停止。请把问题描述得更具体一些，例如带上户型、预算或具体型号。）"
+            )
+            logger.error(f"[agent] 触达步数上限 {MAX_AGENT_STEPS}，已中断：{query[:40]}")
+        except Exception as e:
+            # 模型请求超时（openai SDK 抛出 APITimeoutError）会从这里冒出来。
+            # 只把"超时/连接类"错误转成人话，其他异常继续往上抛——程序 bug 不能被伪装成"服务繁忙"。
+            name = type(e).__name__
+            if isinstance(e, (TimeoutError, ConnectionError)) or "Timeout" in name:
+                abort_note = (
+                    f"（本次请求超时：模型侧 {MODEL_IDLE_TIMEOUT:.0f} 秒内没有返回结果，已中断。"
+                    f"请稍后重试，或把问题拆小一点。）"
+                )
+                logger.error(f"[agent] 模型请求超时（{name}），已中断：{query[:40]}")
+            else:
+                raise
+        finally:
+            # 超时/超步数后必须显式关掉上游生成器，否则 MCP 会话会一直挂着
+            try:
+                await asyncio.wait_for(stream.aclose(), timeout=10)
+            except Exception as e:
+                logger.debug(f"[agent] 关闭上游流时忽略异常：{e}")
+
+        if abort_note:
+            full += abort_note
+            yield abort_note
 
         self._save_message("human", query)
         self._save_message("ai", full)
